@@ -351,6 +351,54 @@ def run_argv(f):
     return a
 
 
+def split_ref(ref):
+    """'nginx' -> ('docker.io', 'library/nginx', 'latest', default_tag=True)."""
+    name, tag, digest = ref, "", ""
+    if "@" in name:
+        name, digest = name.split("@", 1)
+    if ":" in name.rsplit("/", 1)[-1]:
+        name, tag = name.rsplit(":", 1)
+    first, _, rest = name.partition("/")
+    if rest and ("." in first or ":" in first or first == "localhost"):
+        reg, path = first, rest
+    else:
+        reg, path = "docker.io", name
+        if "/" not in path:
+            path = "library/" + path
+    return reg, path, digest or tag or "latest", not (tag or digest)
+
+
+def pull_stream(ref, on_msg, keep):
+    """POST /images/create and feed each progress message (a dict) to on_msg.
+    keep(conn) receives the connection so the pull can be cancelled by closing it."""
+    name, tag = ref, ""
+    if "@" not in ref and ":" in ref.rsplit("/", 1)[-1]:
+        name, tag = ref.rsplit(":", 1)
+    url = f"/images/create?fromImage={quote(name, safe='')}" + (f"&tag={quote(tag, safe='')}" if tag else "&tag=latest" if "@" not in ref else "")
+    conn = UnixHTTP(SOCK, timeout=600)
+    keep(conn)
+    try:
+        conn.request("POST", url)
+        resp = conn.getresponse()
+        if resp.status >= 400:
+            msg = resp.read().decode(errors="replace")
+            try:
+                msg = json.loads(msg).get("message", msg)
+            except ValueError:
+                pass
+            raise RuntimeError(msg.strip())
+        while True:
+            line = resp.readline()
+            if not line:
+                break
+            try:
+                on_msg(json.loads(line))
+            except ValueError:
+                continue
+    finally:
+        conn.close()
+
+
 def wrap(text, width):
     out, line = [], ""
     for word in text.split(" "):
@@ -787,6 +835,8 @@ class UI:
         self.help_scroll = 0
         self.confirm = None   # (question, command, callback)
         self.form = None      # run form state (images view, r)
+        self.pull = None      # pull dialog state (images view, p)
+        self.goto_img = None  # (image ref, open the run form?) to select once it shows up
         self.goto = None      # container id to select once it shows up
         self.rows = []
         self.msg = None       # (text, color, command, t)
@@ -1156,6 +1206,76 @@ class UI:
         self.cache.invalidate()
         self.col.wake.set()
 
+    # ------------------------------------------------------------ pull
+    def open_pull(self):
+        self.pull = {"text": "", "phase": "input", "layers": {}, "lock": threading.Lock(),
+                     "status": "", "err": None, "conn": None, "ref": "", "t0": 0, "t1": 0}
+
+    def pull_key(self, k):
+        pl = self.pull
+        if pl["phase"] == "input":
+            if k == 27:
+                self.pull = None
+            elif k in (10, 13, curses.KEY_ENTER):
+                if pl["text"]:
+                    self.start_pull()
+            elif k in (curses.KEY_BACKSPACE, 127, 8):
+                pl["text"] = pl["text"][:-1]
+            elif 32 < k < 127 and re.fullmatch(r"[a-zA-Z0-9._/:@-]", chr(k)) and len(pl["text"]) < 120:
+                pl["text"] += chr(k)
+        elif pl["phase"] == "pulling":
+            if k == 27:
+                pl["phase"] = "cancelled"
+                try:
+                    pl["conn"].sock.shutdown(socket.SHUT_RDWR)
+                except (AttributeError, OSError):
+                    pass
+                self.pull = None
+                self.flash("pull cancelled (layers already downloaded are kept)", YELLOW, f"docker pull {pl['ref']}")
+        else:
+            self.pull = None
+            if pl["phase"] == "done" and k in (ord("r"), 10, 13, curses.KEY_ENTER):
+                self.goto_img = (pl["ref"], k == ord("r"))
+
+    def start_pull(self):
+        pl = self.pull
+        reg, path, tag, default = split_ref(pl["text"])
+        pl["ref"] = pl["text"] + (":latest" if default else "")
+        pl["phase"], pl["t0"] = "pulling", time.time()
+        cli = f"docker pull {pl['ref']}"
+
+        def on_msg(m):
+            with pl["lock"]:
+                if m.get("error"):
+                    raise RuntimeError(m["error"])
+                lid, st = m.get("id"), m.get("status", "")
+                pd = m.get("progressDetail") or {}
+                if lid and re.fullmatch(r"[0-9a-f]{12,64}", lid):
+                    ly = pl["layers"].setdefault(lid, {"st": "", "cur": 0, "total": 0, "size": 0})
+                    ly["st"] = st
+                    if pd.get("total"):
+                        ly["cur"], ly["total"] = pd.get("current", 0), pd["total"]
+                        if st == "Downloading":
+                            ly["size"] = pd["total"]
+                elif st:
+                    pl["status"] = st
+
+        def work():
+            try:
+                pull_stream(pl["ref"], on_msg, lambda c: pl.__setitem__("conn", c))
+                if pl["phase"] == "cancelled":
+                    return
+                pl["phase"], pl["t1"] = "done", time.time()
+                up = "up to date" in pl["status"]
+                self.flash(f"✓ {pl['ref']} " + ("was already up to date" if up else "downloaded"), GREEN, cli)
+            except Exception as e:  # noqa: BLE001
+                if pl["phase"] == "cancelled":
+                    return
+                pl["phase"], pl["err"], pl["t1"] = "error", str(e), time.time()
+                self.flash(f"✗ pull failed: {e}", RED, cli)
+            self.cache.invalidate()
+        threading.Thread(target=work, daemon=True).start()
+
     def resource_action(self, item, key):
         if self.view == 1:
             ref = item["tag"] if item["tag"] != "<none>:<none>" else item["short"]
@@ -1210,6 +1330,9 @@ class UI:
             elif 32 <= k < 0x110000:
                 self.filter += chr(k)
             self.sel[self.view], self.sel_key[self.view] = 0, None
+            return True
+        if self.pull:
+            self.pull_key(k)
             return True
         if self.form:
             self.form_key(k)
@@ -1320,6 +1443,8 @@ class UI:
                 self.set_tab(3)
             elif ch in ("s", "r", "p", "x", "e") and self.current:
                 self.container_action(self.current, ch)
+        elif self.view == 1 and ch == "p":
+            self.open_pull()
         elif ch in ("x", "P", "r") and (self.current or ch == "P") and (ch != "r" or self.view == 1):
             self.resource_action(self.current, ch)
         return True
@@ -1336,7 +1461,7 @@ class UI:
             if self.help:
                 self.help_scroll = max(0, self.help_scroll + d)
                 return True
-            if self.form:
+            if self.form or self.pull:
                 return True
             y0, y1 = self.regions.get("detail", (-1, -1))
             if y0 <= my < y1 and self.view == 0 and self.tab:
@@ -1385,6 +1510,8 @@ class UI:
             self.draw_confirm()
         if self.form:
             self.draw_run()
+        if self.pull:
+            self.draw_pull()
         self.scr.refresh()
 
     def draw_header(self, rows):
@@ -1962,6 +2089,16 @@ class UI:
             items = [i for i in items if self.filter.lower() in i["tag"].lower()]
         items.sort(key=lambda i: (not i["used"], -i["size"]))
         self.max_size = max([i["size"] for i in items] or [1])
+        if self.goto_img:
+            ref, run = self.goto_img
+            want = ref if not ref.startswith("docker.io/") else ref.split("/", 1)[1]
+            want = want[len("library/"):] if want.startswith("library/") else want
+            hit = next((i for i in items if i["tag"] == want), None)
+            if hit:
+                self.goto_img, self.filter = None, ""
+                self.sel_key[1] = hit["id"]
+                if run:
+                    self.open_run(hit)
         tbl_h, det_h, ev_w = self.side_split(y0, y1, len(items))
         total = sum(i["size"] for i in items)
         cols = [("dot", "", 1), ("tag", "REPOSITORY:TAG", 0), ("id", "ID", 12), ("size", "SIZE", 22),
@@ -1969,7 +2106,7 @@ class UI:
         sel = None
         if tbl_h >= 4:
             sel = self.table(y0, 0, tbl_h, self.w, "images", cols, items, self.image_cell,
-                             right=f"{len(items)} image{'s' if len(items) != 1 else ''} · {human(total)}  ·  r run · x delete · P prune")
+                             right=f"{len(items)} image{'s' if len(items) != 1 else ''} · {human(total)}  ·  p pull · r run · x delete · P prune")
             self.loading(y0, data, items)
         elif items:
             sel = items[min(self.sel[1], len(items) - 1)]
@@ -2231,7 +2368,7 @@ class UI:
         keys = {
             0: [("↑↓", "move"), ("←→", "tabs"), ("s", "start/stop"), ("r", "restart"), ("p", "pause"), ("e", "shell"),
                 ("x", "remove"), ("l", "logs"), ("/", "filter"), ("c/m/n", "sort"), ("a", "stopped"), ("?", "help"), ("q", "quit")],
-            1: [("↑↓", "move"), ("r", "run"), ("x", "delete"), ("P", "prune dangling"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
+            1: [("↑↓", "move"), ("p", "pull"), ("r", "run"), ("x", "delete"), ("P", "prune dangling"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
             2: [("↑↓", "move"), ("x", "delete"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
             3: [("↑↓", "move"), ("x", "remove"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
         }[self.view]
@@ -2350,6 +2487,94 @@ class UI:
         self.put(y + h - 1, kx, keys, self.pal(DIM, BASE), mx)
         self.hit(y + h - 1, kx, kx + 11, self.submit_run)
 
+    def draw_pull(self):
+        pl = self.pull
+        with pl["lock"]:
+            layers = [(k, dict(v)) for k, v in pl["layers"].items()]
+        phase = pl["phase"]
+        body = max(1, len(layers)) if phase != "input" else 0
+        h = min(self.h - 2, 9 + body)
+        title = "pull" if phase == "input" else f"pull {pl['ref']}"
+        y, x, h, w = self.modal(h, 80, title, BLUE)
+        lx, mx = x + 3, x + w - 2
+        if phase == "input":
+            t = pl["text"]
+            self.segs(y + 2, lx, [("image  ", SUB), (t, TEXT, True), ("▏", BLUE, True),
+                                  ("" if t else "e.g. nginx, nginx:alpine, postgres:17", FAINT)], mx, BASE)
+            if t:
+                reg, path, tag, default = split_ref(t)
+                user, _, name = path.rpartition("/")
+                self.segs(y + 4, lx, [(reg, PEACH, True), ("/", DIM), (user + "/" if user else "", YELLOW, True),
+                                      (name, TEXT, True), (":", DIM), (tag, BLUE, True)], mx, BASE)
+                self.segs(y + 5, lx, [("registry", PEACH), (" · ", DIM), ("user" if user != "library" else "library = official image", YELLOW),
+                                      (" · ", DIM), ("name", TEXT), (" · ", DIM), ("tag" + (" (none given → latest)" if default else ""), BLUE)], mx, BASE)
+                self.segs(y + 7, lx, [("$ ", MAUVE, True), (f"docker pull {t}", TEXT, True)], mx, BASE)
+            else:
+                for i, line in enumerate(wrap("Downloads an image from a registry (Docker Hub by default) so you can run it. "
+                                              "Pulling an image you already have updates it to the newest version of that tag.", w - 6)[:3]):
+                    self.segs(y + 4 + i, lx, [(line, SKY)], mx, BASE)
+            keys = " enter pull · esc cancel "
+        else:
+            done_st = ("Pull complete", "Already exists", "Download complete")
+            total = sum(ly["size"] for _, ly in layers)
+            got = sum(ly["size"] if ly["st"] in done_st or ly["st"].startswith(("Extract", "Verif")) else
+                      ly["cur"] if ly["st"] == "Downloading" else 0 for _, ly in layers)
+            ndone = sum(1 for _, ly in layers if ly["st"] in ("Pull complete", "Already exists"))
+            pct = 100 if phase == "done" else got / total * 100 if total else 0
+            el = (pl["t1"] or time.time()) - pl["t0"]
+            if layers or phase == "pulling":
+                self.hbar(y + 2, lx, 30, pct, G_RX, BASE)
+            if layers:
+                self.segs(y + 2, lx + 32, [(f"{pct:3.0f}%  ", TEXT, True), (f"{human(got)} / {human(total)}  " if total else "", SUB),
+                                           (f"{ndone}/{len(layers)} layers", DIM)], mx, BASE)
+            rows = h - 8 if len(layers) <= h - 8 else h - 9
+            for i, (lid, ly) in enumerate(layers[:rows]):
+                yy, st = y + 4 + i, ly["st"]
+                if phase == "done" and st != "Already exists":
+                    st = "Pull complete"   # small config layers never report it
+                self.put(yy, lx, lid[:12], self.pal(DIM, BASE))
+                if st == "Already exists":
+                    self.segs(yy, lx + 14, [("✓ already exists", GREEN), ("  shared with an image you have", FAINT)], mx, BASE)
+                    continue
+                if st == "Pull complete":
+                    p, c = 100, G_LOAD[:1]
+                elif st in ("Downloading", "Extracting") and ly["total"]:
+                    p, c = ly["cur"] / ly["total"] * 100, (G_RX if st == "Downloading" else G_MEM)
+                elif st in ("Download complete", "Verifying Checksum"):
+                    p, c = 100, G_RX
+                else:
+                    p, c = 0, G_RX
+                self.hbar(yy, lx + 14, 20, p, c, BASE)
+                col = GREEN if st == "Pull complete" else BLUE if st == "Downloading" else MAUVE if st == "Extracting" else SUB
+                size = (f"{human(ly['cur'])} / {human(ly['total'])}" if st in ("Downloading", "Extracting") and ly["total"]
+                        else human(ly["size"]) if ly["size"] else "")
+                self.segs(yy, lx + 36, [(f"{st.lower():<20}", col), (size, SUB)], mx, BASE)
+            if len(layers) > rows:
+                self.put(y + 4 + rows, lx, f"… +{len(layers) - rows} more layers", self.pal(DIM, BASE))
+            if not layers and phase == "pulling":
+                self.put(y + 4, lx, SPIN[self.frame % len(SPIN)] + " contacting the registry…", self.pal(SUB, BASE))
+            elif not layers and phase == "done":
+                self.put(y + 4, lx, "nothing to download: every layer was already on this machine", self.pal(DIM, BASE))
+            sy = y + h - 4
+            if phase == "pulling":
+                self.segs(sy, lx, [(SPIN[self.frame % len(SPIN)] + " ", BLUE, True), (pl["status"] or "pulling", SUB),
+                                   (f"  · {el:.0f}s", DIM)], mx, BASE)
+                keys = " esc cancel "
+            elif phase == "done":
+                up = "up to date" in pl["status"]
+                self.segs(sy, lx, [("✓ ", GREEN, True), ("already had the newest version" if up else f"downloaded in {el:.0f}s", GREEN, True)], mx, BASE)
+                self.segs(sy + 1, lx, [(pl["status"].replace("Status: ", ""), DIM)], mx, BASE)
+                keys = " r run it · enter select it · esc close "
+            else:
+                err = pl["err"] or ""
+                why = (" · check the name and tag; private images need docker login" if ("denied" in err or "not found" in err)
+                       and "login" not in err else "")
+                for i, line in enumerate(wrap("✗ " + err + why, w - 6)[:2]):
+                    self.segs(sy + i, lx, [(line, RED, i == 0)], mx, BASE)
+                keys = " any key closes "
+            self.segs(y + h - 2, lx, [("$ ", MAUVE, True), (f"docker pull {pl['ref']}", SUB)], mx, BASE)
+        self.put(y + h - 1, x + max(2, w - len(keys) - 3), keys, self.pal(DIM, BASE), mx)
+
     HELP = [
         [("SHORTCUTS", MAUVE, True)],
         [("  1 2 3 4   ", BLUE, True), ("containers · images · volumes · networks  (or click the top bar)", SUB)],
@@ -2362,6 +2587,7 @@ class UI:
         [("  c m n     ", BLUE, True), ("sort cpu/mem/name  ", SUB), ("a       ", BLUE, True), ("show/hide stopped", SUB)],
         [("  b         ", BLUE, True), ("solid/transparent  ", SUB), ("g       ", BLUE, True), ("block / braille graphs", SUB)],
         [("  C         ", BLUE, True), ("clear the events panel ", SUB), ("r       ", BLUE, True), ("run a container (images view)", SUB)],
+        [("  p         ", BLUE, True), ("pull an image (images view)", SUB)],
         [("  mouse     ", BLUE, True), ("click selects, wheel scrolls, click the tabs", SUB)],
         [],
         [("WHAT THE NUMBERS MEAN", MAUVE, True)],
