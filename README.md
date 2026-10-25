@@ -64,7 +64,7 @@ cd dockerax
 
 ![pull dialog with per-layer progress](docs/pull.png)
 
-**Logs** — live `docker logs -f` of the selected container, with stderr marked and levels colored.
+**Logs** — live `docker logs -f` of the selected container, with stderr marked and levels colored. `f` finds text (only matching lines, highlighted), `w` shows only warnings/errors, and the matching `docker logs … 2>&1 | grep` command is shown.
 
 ![logs tab](docs/logs.png)
 
@@ -76,7 +76,7 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
 - **Containers** — grouped by compose project as a tree; CPU sparkline, memory bar, network rates, status and ports per row; animated state icons (unhealthy blinks, restarting spins).
 - **Bottom panel tabs** for the selected container:
   - **metrics** — CPU, memory and network (in/out mirrored) history graphs with a value axis, grid lines, the peak reached, reference lines (1 core, memory limit) and a time axis.
-  - **logs** — live `docker logs -f`, stderr marked in red, log levels and HTTP status codes colored, scrollback.
+  - **logs** — live `docker logs -f`, stderr marked in red, log levels and HTTP status codes colored, scrollback. **Find** (`f`) keeps only the lines with that text and highlights it, still live; `w` cycles all → warnings and errors → errors; `H` searches the last 3000 lines instead of 300. The equivalent `docker logs … 2>&1 | grep -i …` is shown above the lines.
   - **info** — restart policy, command, health, ports explained in plain words with a URL, networks with IPs, mounts, env vars (secrets masked) and an approximate `docker run` command that would recreate it.
   - **processes** — `docker top`, sorted by CPU.
 - **Compose projects** — select the project row to see its services in start order (from `depends_on`), what each one needs, totals and CPU/memory graphs for the whole project, the compose file, networks and volumes. `s` stops/starts everything in dependency order (waiting for `service_healthy` dependencies), `r` restarts, `p` pauses, `x` is `docker compose down` (containers and networks removed, volumes kept) and `u` is `docker compose up -d` (re-reads the compose file — also brings back a project you took down).
@@ -107,6 +107,9 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
 | `←` `→` / `Tab` | switch the bottom tab (containers) or the view |
 | `PgUp` `PgDn` | scroll logs / info / processes |
 | `End` / `G` | resume following logs |
+| `f` | find in logs: only lines with that text (`Esc` clears) |
+| `w` | logs: all → warnings and errors → errors only |
+| `H` | logs: last 3000 lines instead of 300 |
 | `s` | start / stop (on a compose project row: the whole project) |
 | `r` | restart |
 | `p` | pause / resume |
