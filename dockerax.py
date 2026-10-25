@@ -67,7 +67,7 @@ SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 APP_BG = (24, 24, 37)
 CONFIG = os.path.expanduser("~/.config/dockerax.json")
 BLOCKS = " ▁▂▃▄▅▆▇█"
-VIEWS = ["containers", "images", "volumes", "networks"]
+VIEWS = ["containers", "images", "volumes", "networks", "disk"]
 TABS = ["metrics", "logs", "info", "processes"]
 
 TIPS = [
@@ -83,6 +83,7 @@ TIPS = [
     "use the mouse: click to select, wheel to scroll",
     "/ filters by name or image",
     "select a compose project row (▾) to stop, restart or take down the whole project",
+    "5 shows what takes disk space and what can be freed safely",
     "b toggles solid/transparent background · g toggles block/braille graphs",
 ]
 
@@ -839,9 +840,9 @@ class UI:
         self.feed.start()
         self.view = 0
         self.tab = 0
-        self.sel = [0, 0, 0, 0]
-        self.sel_key = [None] * 4
-        self.scroll = [0, 0, 0, 0]
+        self.sel = [0] * len(VIEWS)
+        self.sel_key = [None] * len(VIEWS)
+        self.scroll = [0] * len(VIEWS)
         self.sort = "default"
         self.show_all = True
         self.filter = ""
@@ -1652,7 +1653,7 @@ class UI:
                 return False
         elif ch == "?":
             self.help, self.help_scroll = True, 0
-        elif ch in "1234" and ch:
+        elif ch in "12345" and ch:
             self.set_view(int(ch) - 1)
         elif ch == "/":
             self.typing = True
@@ -1681,12 +1682,12 @@ class UI:
             if self.view == 0:
                 self.set_tab(self.tab + 1)
             else:
-                self.set_view((self.view + 1) % 4)
+                self.set_view((self.view + 1) % len(VIEWS))
         elif k in (curses.KEY_LEFT, curses.KEY_BTAB):
             if self.view == 0:
                 self.set_tab(self.tab - 1)
             else:
-                self.set_view((self.view - 1) % 4)
+                self.set_view((self.view - 1) % len(VIEWS))
         elif k in (curses.KEY_DOWN, ord("j")):
             if self.zoom and self.view == 0 and self.tab:
                 self.detail_scroll = max(0, self.detail_scroll + (-1 if self.tab == 1 else 1))
@@ -1698,12 +1699,16 @@ class UI:
             else:
                 self.move(-1)
         elif k == curses.KEY_NPAGE:
-            if self.view == 0 and self.tab:
+            if self.view == 4:
+                self.detail_scroll += 10
+            elif self.view == 0 and self.tab:
                 self.detail_scroll = max(0, self.detail_scroll - 10) if self.tab == 1 else self.detail_scroll + 10
             else:
                 self.move(10)
         elif k == curses.KEY_PPAGE:
-            if self.view == 0 and self.tab:
+            if self.view == 4:
+                self.detail_scroll = max(0, self.detail_scroll - 10)
+            elif self.view == 0 and self.tab:
                 self.detail_scroll = self.detail_scroll + 10 if self.tab == 1 else max(0, self.detail_scroll - 10)
             else:
                 self.move(-10)
@@ -1744,6 +1749,8 @@ class UI:
                 self.container_action(self.current, ch)
         elif self.view == 1 and ch == "p":
             self.open_pull()
+        elif self.view == 4 and ch == "x" and self.current:
+            self.prune(self.current)
         elif ch in ("x", "P", "r") and (self.current or ch == "P") and (ch != "r" or self.view == 1):
             self.resource_action(self.current, ch)
         return True
@@ -1801,7 +1808,7 @@ class UI:
             self.draw_host(1, host_h, host, hh)
         y0 = 1 + host_h
         y1 = h - 1
-        [self.view_containers, self.view_images, self.view_volumes, self.view_networks][self.view](y0, y1, rows)
+        [self.view_containers, self.view_images, self.view_volumes, self.view_networks, self.view_disk][self.view](y0, y1, rows)
         self.draw_footer()
         if self.help:
             self.draw_help()
@@ -2829,6 +2836,216 @@ class UI:
             n = len(it["members"])
             self.put(y, x, f"{n} container" + ("s" if n != 1 else ""), self.pal(TEXT if n else FAINT, bg))
 
+    # ------------------------------------------------------------ disk
+    def disk_items(self, d):
+        """docker system df, one row per kind. Newer engines send the totals; older ones get docker CLI's math."""
+        anon = re.compile(r"[0-9a-f]{64}")
+        imgs, ctrs = d.get("Images") or [], d.get("Containers") or []
+        vols, bcs = d.get("Volumes") or [], d.get("BuildCache") or []
+        # what image prune -a frees: the layers of unused images that no other image shares. Computed here
+        # because Docker 29 reports every image as reclaimable, even the ones containers use.
+        free_img = sum(i["Size"] - max(0, i.get("SharedSize", 0)) for i in imgs if not i.get("Containers"))
+        vsize = [v for v in vols if (v.get("UsageData") or {}).get("Size", -1) >= 0]
+
+        def usage(key, total, reclaim, count, active):
+            u = d.get(key) or {}
+            return {"size": u.get("TotalSize", total), "reclaim": u.get("Reclaimable", reclaim),
+                    "count": u.get("TotalCount", count), "active": u.get("ActiveCount", active)}
+        alive = ("running", "paused", "restarting")
+        return [
+            dict(usage("ImageUsage", d.get("LayersSize", 0), 0, len(imgs), sum(1 for i in imgs if i.get("Containers"))),
+                 reclaim=free_img, id="images", name="images", cmd="docker image prune -a", data=imgs),
+            dict(usage("ContainerUsage", sum(c.get("SizeRw", 0) for c in ctrs),
+                       sum(c.get("SizeRw", 0) for c in ctrs if c.get("State") not in alive), len(ctrs),
+                       sum(1 for c in ctrs if c.get("State") in alive)),
+                 id="containers", name="containers", cmd="docker container prune", data=ctrs),
+            dict(usage("VolumeUsage", sum(v["UsageData"]["Size"] for v in vsize),
+                       sum(v["UsageData"]["Size"] for v in vsize if not v["UsageData"].get("RefCount")), len(vols),
+                       sum(1 for v in vols if (v.get("UsageData") or {}).get("RefCount"))),
+                 id="volumes", name="volumes", cmd="docker volume prune", data=vols,
+                 # what x really frees: unused anonymous volumes (named ones are your data: volumes view, x)
+                 prunable=[v for v in vsize if not v["UsageData"].get("RefCount") and anon.fullmatch(v["Name"])]),
+            dict(usage("BuildCacheUsage", sum(b.get("Size", 0) for b in bcs),
+                       sum(b.get("Size", 0) for b in bcs if not b.get("InUse") and not b.get("Shared")), len(bcs),
+                       sum(1 for b in bcs if b.get("InUse"))),
+                 id="build", name="build cache", cmd="docker builder prune", data=bcs),
+        ]
+
+    def view_disk(self, y0, y1, rows):
+        d = self.cache.get(("df",), lambda: api("GET", "/system/df", timeout=60), 30)
+        items = self.disk_items(d) if isinstance(d, dict) else []
+        if items and items[2]["reclaim"] < 0:
+            items[2]["reclaim"] = 0
+        self.disk_max = max([it["size"] for it in items] + [1])
+        tbl_h, det_h, ev_w = self.side_split(y0, y1, len(items) + 2)
+        cols = [("dot", "", 1), ("name", "TYPE", 12), ("count", "COUNT", 15), ("size", "SIZE", 22),
+                ("reclaim", "RECLAIMABLE", 16), ("cmd", "FREES IT", 0)]
+        total = sum(it["size"] for it in items)
+        host = self.snapshot()[1]
+        right = f"docker uses {human(total)}"
+        if host.get("disk_total"):
+            right += f" · disk {human(host['disk_total'] - host['disk'])} free of {human(host['disk_total'])}"
+        sel = None
+        if tbl_h >= 4:
+            sel = self.table(y0, 0, tbl_h, self.w, "disk usage · docker system df", cols, items, self.disk_cell, right=right)
+            self.loading(y0, d, items)
+            if items and tbl_h >= len(items) + 5:
+                rc = sum(it["reclaim"] for it in items)
+                msg = [(human(rc), PEACH, True), (" can be freed without touching anything in use", DIM)] if rc else \
+                      [("✓ ", GREEN, True), ("nothing to free — everything here is in use", DIM)]
+                self.segs(y0 + len(items) + 3, 4, msg, self.w - 2)
+        elif items:
+            sel = items[min(self.sel[4], len(items) - 1)]
+        self.current = sel
+        dy = y0 + tbl_h
+        self.regions["detail"] = (dy, y1)
+        L = self.disk_lines(sel) if sel else []
+        self.lines_panel(dy, 0, det_h, self.w - ev_w, f"{sel['name']} · what x deletes" if sel else "details", L,
+                         "$ docker system df -v" if sel else "")
+        if ev_w:
+            self.draw_events(dy, self.w - ev_w, det_h, ev_w)
+
+    def disk_cell(self, it, key, y, x, w, bg):
+        if key == "dot":
+            self.put(y, x, "●", self.pal(PEACH if it["reclaim"] > 0 else GREEN, bg) | BOLD)
+        elif key == "name":
+            self.put(y, x, it["name"], self.pal(TEXT, bg) | BOLD, x + w)
+        elif key == "count":
+            self.segs(y, x, [(f"{it['count']:>3}", TEXT), (f"  {it['active']} in use", DIM)], x + w, bg)
+        elif key == "size":
+            self.hbar(y, x, 12, it["size"] / self.disk_max * 100, G_SIZE, bg)
+            self.put(y, x + 13, f"{human(it['size']):>8}", self.pal(TEXT, bg))
+        elif key == "reclaim":
+            pct = it["reclaim"] * 100 / it["size"] if it["size"] else 0
+            on = it["reclaim"] > 0
+            self.segs(y, x, [(f"{human(it['reclaim']):>8}", PEACH if on else FAINT, on),
+                             (f"  {pct:3.0f}%" if on else "", DIM)], x + w, bg)
+        elif key == "cmd":
+            self.segs(y, x, [("x ", BLUE, True), (it["cmd"], SUB)], x + w, bg)
+
+    def disk_lines(self, it):
+        k, L = it["id"], []
+        now = time.time()
+
+        def row(icon, color, name, size, note, ncolor=DIM):
+            L.append([(f"  {icon} ", color, True), (f"{name[:30]:<32}", TEXT), (f"{human(size):>8}  ", SUB), (note, ncolor)])
+        if k == "images":
+            L.append([("what it is: ", MAUVE, True), ("the templates containers are created from. Layers shared by several", SUB)])
+            L.append([("            ", DIM), ("images are stored once, so SIZE counts each layer only once.", SUB)])
+            L.append([("x           ", BLUE, True), ("docker image prune -a", TEXT), (" deletes every image no container uses (running or", DIM)])
+            L.append([("            ", DIM), ("stopped). They can be pulled again. Without -a only dangling <none> images go.", DIM)])
+            L.append([])
+            unused = sorted((i for i in it["data"] if not i.get("Containers")), key=lambda i: -i["Size"])
+            L.append([(f"not used by any container ({len(unused)})", PEACH if unused else DIM, True)])
+            for i in unused:
+                tag = (i.get("RepoTags") or ["<none>:<none>"])[0]
+                row("○", DIM, tag, i["Size"], f"built {ago(now - i.get('Created', now))} ago" + ("  · dangling" if tag == "<none>:<none>" else ""))
+            if not unused:
+                L.append([("  nothing — every image is used by a container", FAINT)])
+            L.append([])
+            L.append([("kept: in use", GREEN, True)])
+            for i in sorted((i for i in it["data"] if i.get("Containers")), key=lambda i: -i["Size"]):
+                n = i["Containers"]
+                row("●", GREEN, (i.get("RepoTags") or ["<none>"])[0], i["Size"], f"{n} container{'s' if n != 1 else ''}")
+        elif k == "containers":
+            L.append([("what it is: ", MAUVE, True), ("each container has a thin writable layer on top of its image — the", SUB)])
+            L.append([("            ", DIM), ("files it created or changed. Removing the container removes that layer.", SUB)])
+            L.append([("x           ", BLUE, True), ("docker container prune", TEXT), (" removes every stopped container (volumes stay).", DIM)])
+            L.append([])
+            alive = ("running", "paused", "restarting")
+            stopped = sorted((c for c in it["data"] if c.get("State") not in alive), key=lambda c: -c.get("SizeRw", 0))
+            L.append([(f"stopped ({len(stopped)})", PEACH if stopped else DIM, True)])
+            for c in stopped:
+                row("○", DIM, c["Names"][0].lstrip("/"), c.get("SizeRw", 0), status_text(c.get("Status", "")))
+            if not stopped:
+                L.append([("  nothing — no stopped containers", FAINT)])
+            L.append([])
+            L.append([("kept: running", GREEN, True)])
+            for c in sorted((c for c in it["data"] if c.get("State") in alive), key=lambda c: -c.get("SizeRw", 0)):
+                row("●", GREEN, c["Names"][0].lstrip("/"), c.get("SizeRw", 0), f"image {c.get('Image', '')}")
+        elif k == "volumes":
+            L.append([("what it is: ", MAUVE, True), ("data kept outside the containers (databases, uploads…).", SUB)])
+            L.append([("x           ", BLUE, True), ("docker volume prune", TEXT), (" deletes unused ", DIM), ("anonymous", TEXT),
+                      (" volumes only — the ones a", DIM)])
+            L.append([("            ", DIM), ("Dockerfile VOLUME created without a name. Named volumes hold your data: delete", DIM)])
+            L.append([("            ", DIM), ("them one by one in the volumes view (3, x) — on purpose.", DIM)])
+            L.append([])
+            pr = it["prunable"]
+            L.append([(f"unused anonymous — x deletes these ({len(pr)})", PEACH if pr else DIM, True)])
+            for v in pr:
+                row("○", DIM, v["Name"][:12] + "… anonymous", v["UsageData"]["Size"], f"created {ago(now - (parse_ts(v.get('CreatedAt')) or now))} ago")
+            if not pr:
+                L.append([("  nothing", FAINT)])
+            named = [v for v in it["data"] if v not in pr and not (v.get("UsageData") or {}).get("RefCount")]
+            if named:
+                L.append([])
+                L.append([(f"unused named — kept, delete in the volumes view ({len(named)})", YELLOW, True)])
+                for v in named:
+                    row("○", YELLOW, v["Name"], (v.get("UsageData") or {}).get("Size", 0), "no container mounts it")
+            L.append([])
+            L.append([("kept: in use", GREEN, True)])
+            for v in it["data"]:
+                n = (v.get("UsageData") or {}).get("RefCount", 0)
+                if n:
+                    row("●", GREEN, v["Name"], v["UsageData"].get("Size", 0), f"{n} container{'s' if n != 1 else ''}")
+        else:
+            L.append([("what it is: ", MAUVE, True), ("layers saved by docker build, so building the same Dockerfile again", SUB)])
+            L.append([("            ", DIM), ("is fast. Safe to delete: the next build is just slower.", SUB)])
+            L.append([("x           ", BLUE, True), ("docker builder prune", TEXT), (" deletes cache not in use and not shared.", DIM)])
+            L.append([("            ", DIM), ("Shared = also part of an image; it's freed when that image is deleted.", DIM)])
+            L.append([])
+            bcs = sorted(it["data"], key=lambda b: -b.get("Size", 0))
+            for b in bcs:
+                desc = re.sub(r"\s+", " ", b.get("Description") or b.get("Type", ""))
+                tag = "in use" if b.get("InUse") else "shared with an image" if b.get("Shared") else "x deletes it"
+                last = parse_ts(b.get("LastUsedAt"))
+                note = tag + (f" · used {ago(now - last)} ago" if last else "")
+                row("●" if b.get("InUse") or b.get("Shared") else "○", GREEN if b.get("InUse") else BLUE if b.get("Shared") else PEACH,
+                    desc, b.get("Size", 0), note, PEACH if tag == "x deletes it" else DIM)
+            if not bcs:
+                L.append([("  empty — nothing was built with docker build on this host (or it was pruned)", FAINT)])
+        L.append([])
+        L.append([("all at once: ", DIM), ("docker system prune", TEXT), (" — stopped containers, unused networks,", DIM)])
+        L.append([("             ", DIM), ("dangling images and build cache.  -a: also unused images.", DIM)])
+        L.append([("             ", DIM), ("--volumes: also anonymous volumes.", DIM)])
+        return L
+
+    def prune(self, it):
+        k = it["id"]
+        if k == "volumes":
+            free = sum(v["UsageData"]["Size"] for v in it["prunable"])
+            n = len(it["prunable"])
+        else:
+            free, n = it["reclaim"], None
+        if not free and not n:
+            return self.flash(f"nothing to free in {it['name']}", DIM)
+        q = {"images": f"Delete every image no container uses? (~{human(free)})",
+             "containers": f"Remove every stopped container? (~{human(free)})",
+             "volumes": f"Delete {n} unused anonymous volume{'s' if n != 1 else ''}? THEIR DATA WILL BE LOST",
+             "build": f"Delete the unused build cache? (~{human(free)})"}[k]
+        cli = it["cmd"]
+
+        def run():
+            if k == "volumes":
+                done = 0
+                for v in it["prunable"]:
+                    api("DELETE", f"/volumes/{quote(v['Name'], safe='')}")
+                    done += v["UsageData"]["Size"]
+                return done
+            url = {"images": "/images/prune?filters=" + quote(json.dumps({"dangling": ["false"]})),
+                   "containers": "/containers/prune", "build": "/build/prune"}[k]
+            return (api("POST", url, timeout=600) or {}).get("SpaceReclaimed", 0)
+
+        def work():
+            self.flash(f"running… {cli}", BLUE)
+            try:
+                self.flash(f"✓ freed {human(run())}", GREEN, cli)
+            except Exception as e:  # noqa: BLE001
+                self.flash(f"✗ {e}", RED, cli)
+            self.cache.invalidate()
+            self.col.wake.set()
+        self.ask(q, cli, lambda: threading.Thread(target=work, daemon=True).start())
+
     def lines_panel(self, y, x, h, w, title, L, cmd):
         self.box(y, x, h, w, title, right="z enlarge")
         if cmd:
@@ -2879,6 +3096,7 @@ class UI:
             1: [("↑↓", "move"), ("p", "pull"), ("r", "run"), ("x", "delete"), ("P", "prune dangling"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
             2: [("↑↓", "move"), ("x", "delete"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
             3: [("↑↓", "move"), ("x", "remove"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
+            4: [("↑↓", "move"), ("x", "free it (prune)"), ("PgUp/Dn", "scroll"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
         }["project" if self.view == 0 and self.current and "_group" in self.current else
           "logs" if self.view == 0 and self.tab == 1 and self.current else self.view]
         x = 1
@@ -3087,7 +3305,7 @@ class UI:
 
     HELP = [
         [("SHORTCUTS", MAUVE, True)],
-        [("  1 2 3 4   ", BLUE, True), ("containers · images · volumes · networks  (or click the top bar)", SUB)],
+        [("  1 2 3 4 5 ", BLUE, True), ("containers · images · volumes · networks · disk  (or click the top bar)", SUB)],
         [("  ↑↓ j k    ", BLUE, True), ("select             ", SUB), ("←→ tab  ", BLUE, True), ("switch the bottom tab", SUB)],
         [("  PgUp/PgDn ", BLUE, True), ("scroll logs/info   ", SUB), ("End     ", BLUE, True), ("resume following logs", SUB)],
         [("  s         ", BLUE, True), ("start / stop       ", SUB), ("r       ", BLUE, True), ("restart", SUB)],
