@@ -698,10 +698,10 @@ class EventFeed(threading.Thread):
 class LogTail(threading.Thread):
     """docker logs -f for one container, demultiplexing stdout/stderr."""
 
-    def __init__(self, cid, tty):
+    def __init__(self, cid, tty, tail=300):
         super().__init__(daemon=True)
-        self.cid, self.tty = cid, tty
-        self.lines = deque(maxlen=3000)
+        self.cid, self.tty, self.tail = cid, tty, tail
+        self.lines = deque(maxlen=max(3000, tail))
         self.partial = {1: "", 2: ""}
         self.conn = None
         self.stopped = False
@@ -711,7 +711,7 @@ class LogTail(threading.Thread):
     def run(self):
         try:
             self.conn = UnixHTTP(SOCK, timeout=None)
-            self.conn.request("GET", f"/containers/{self.cid}/logs?stdout=1&stderr=1&follow=1&tail=300&timestamps=1")
+            self.conn.request("GET", f"/containers/{self.cid}/logs?stdout=1&stderr=1&follow=1&tail={self.tail}&timestamps=1")
             resp = self.conn.getresponse()
             if resp.status >= 400:
                 raise RuntimeError(resp.read().decode(errors="replace"))
@@ -846,6 +846,10 @@ class UI:
         self.show_all = True
         self.filter = ""
         self.typing = False
+        self.log_find = ""      # logs tab: only lines containing this (case-insensitive)
+        self.log_typing = False
+        self.log_level = 0      # logs tab: 0 all · 1 warnings and errors · 2 errors
+        self.log_tail = 300     # lines of history asked for (H toggles 3000)
         self.zoom = False
         self.help = False
         self.help_scroll = 0
@@ -1586,6 +1590,17 @@ class UI:
     def handle_key(self, k):
         if k == curses.KEY_MOUSE:
             return self.handle_mouse()
+        if self.log_typing:
+            if k in (10, 13, curses.KEY_ENTER):
+                self.log_typing = False
+            elif k == 27:
+                self.log_typing, self.log_find = False, ""
+            elif k in (curses.KEY_BACKSPACE, 127, 8):
+                self.log_find = self.log_find[:-1]
+            elif 32 <= k < 0x110000:
+                self.log_find += chr(k)
+            self.detail_scroll = 0
+            return True
         if self.typing:
             if k in (10, 13, curses.KEY_ENTER):
                 self.typing = False
@@ -1629,6 +1644,8 @@ class UI:
         if k == 27:
             if self.zoom:
                 self.zoom = False
+            elif self.view == 0 and self.tab == 1 and (self.log_find or self.log_level):
+                self.log_find, self.log_level, self.detail_scroll = "", 0, 0
             elif self.filter:
                 self.filter = ""
             else:
@@ -1707,6 +1724,20 @@ class UI:
                 self.set_tab(2)
             elif ch == "t":
                 self.set_tab(3)
+            elif ch == "f":
+                self.set_tab(1)
+                self.log_typing = True
+            elif ch == "w":
+                if self.tab != 1:
+                    self.set_tab(1)
+                self.log_level = (self.log_level + 1) % 3
+                self.detail_scroll = 0
+                self.flash(["all log lines", "only warnings and errors", "only errors"][self.log_level], BLUE)
+            elif ch == "H":
+                self.set_tab(1)
+                self.log_tail = 3000 if self.log_tail == 300 else 300
+                self.stop_logs()
+                self.flash(f"loading the last {self.log_tail} lines", BLUE, f"docker logs --tail {self.log_tail}")
             elif ch in ("s", "r", "p", "x", "e", "u") and self.current and "_group" in self.current:
                 self.project_action(self.current, ch)
             elif ch in ("s", "r", "p", "x", "e") and self.current:
@@ -2271,16 +2302,27 @@ class UI:
     def tab_logs(self, r, y, x, h, w):
         ins = self.cache.get(("inspect", r["id"]), lambda: api("GET", f"/containers/{r['id']}/json"), 30)
         lg = self.logs
-        if lg and (lg.cid != r["id"] or (lg.done_at and time.time() - lg.done_at > 3 and r["state"] == "running")):
+        if lg and (lg.cid != r["id"] or lg.tail != self.log_tail or (lg.done_at and time.time() - lg.done_at > 3 and r["state"] == "running")):
             self.stop_logs()
             lg = None
         if lg is None and isinstance(ins, dict):
-            lg = self.logs = LogTail(r["id"], bool((ins.get("Config") or {}).get("Tty")))
+            lg = self.logs = LogTail(r["id"], bool((ins.get("Config") or {}).get("Tty")), self.log_tail)
             lg.start()
         following = self.detail_scroll == 0
         status = [("● following", GREEN)] if following and lg and not lg.done_at else \
                  [("■ end of stream", DIM)] if lg and lg.done_at else [("‖ paused", YELLOW), ("  End jumps back", DIM)]
-        self.segs(y, x, [("$ ", MAUVE), (f"docker logs -f --tail 300 {r['name']}", DIM)], x + w - 22)
+        cmd = f"docker logs -f --tail {self.log_tail} {r['name']}"
+        pipe = ""
+        if self.log_level or self.log_find:
+            cmd += " 2>&1"  # grep only reads stdout: send stderr there too
+            if self.log_level:
+                pipe += f' | grep -iE "{"warn|error|fatal" if self.log_level == 1 else "error|fatal"}"'
+            if self.log_find:
+                pipe += f' | grep -i "{self.log_find}"'
+        self.segs(y, x, [("$ ", MAUVE), (cmd, DIM)], x + w - 22)
+        if pipe:
+            self.segs(y + 1, x, [("   ", DIM), (pipe.lstrip(), SUB)], x + w)
+            y, h = y + 1, h - 1
         self.segs(y, x + w - 20, status, x + w)
         if not lg:
             self.put(y + 2, x, "loading…", self.pal(DIM))
@@ -2288,41 +2330,79 @@ class UI:
         if lg.error:
             self.put(y + 2, x, f"error: {lg.error}", self.pal(RED), x + w)
         lines = list(lg.lines)
+        total = len(lines)
+        find = self.log_find.lower()
+        if find or self.log_level:
+            lines = [ln for ln in lines if find in ln[2].lower() and self.level_of(ln[2]) >= self.log_level]
         body = h - 1
         max_scroll = max(0, len(lines) - body)
         self.detail_scroll = min(self.detail_scroll, max_scroll)
         end = len(lines) - self.detail_scroll
         view = lines[max(0, end - body):end]
         if not lines and not lg.error:
-            self.put(y + 2, x, "(no log output yet)", self.pal(FAINT))
+            if total:
+                what = " and ".join(([f"contain “{self.log_find}”"] if self.log_find else []) +
+                                    ([["", "are warnings or errors", "are errors"][self.log_level]] if self.log_level else []))
+                self.segs(y + 2, x, [(f"none of the last {total} lines {what}", SUB), ("   esc clears", FAINT)], x + w)
+                if self.log_tail == 300:
+                    self.segs(y + 3, x, [("H", BLUE, True), (" searches the last 3000 lines instead", FAINT)], x + w)
+            else:
+                self.put(y + 2, x, "(no log output yet)", self.pal(FAINT))
         for i, (stream, ts, msg) in enumerate(view):
             yy = y + 1 + i
             cx = x
             cx += self.put(yy, cx, "▎" if stream == 2 else " ", self.pal(RED if stream == 2 else FAINT))
             if ts and w > 60:
                 cx += self.put(yy, cx, time.strftime("%H:%M:%S ", time.localtime(ts)), self.pal(FAINT))
-            self.log_line(yy, cx, msg, x + w)
+            self.log_line(yy, cx, msg, x + w, self.log_find)
+        bx = x + w
+        if find or self.log_level:
+            badge = f" {len(lines)} of {total} lines "
+            bx -= len(badge)
+            self.put(y + h - 1, bx, badge, self.pal(BASE, MAUVE) | BOLD)
         if self.detail_scroll and len(lines) > body:
-            self.put(y + h - 1, x + w - 18, f" ↑ {self.detail_scroll} lines ", self.pal(BASE, YELLOW))
+            badge = f" ↑ {self.detail_scroll} lines "
+            self.put(y + h - 1, bx - len(badge) - 1, badge, self.pal(BASE, YELLOW))
 
     LEVELS = [(re.compile(r"\b(ERROR|ERR|FATAL|CRIT(ICAL)?|PANIC|EMERG|error|fatal|panic|Exception|Traceback)\b"), RED),
               (re.compile(r"\b(WARN(ING)?|warn(ing)?)\b"), YELLOW),
               (re.compile(r"\b(DEBUG|TRACE|debug|trace)\b"), DIM)]
     HTTP_CODE = re.compile(r'(?<=" )([1-5]\d\d)(?= )')
 
-    def log_line(self, y, x, msg, maxx):
+    def level_of(self, msg):
+        """2 error · 1 warning · 0 anything else (same rules that color the lines)."""
+        for lvl, (rx, _) in zip((2, 1), self.LEVELS):
+            if rx.search(msg):
+                return lvl
+        return 0
+
+    def log_line(self, y, x, msg, maxx, find=""):
+        msg = msg[:max(0, maxx - x)]
         color = TEXT
         for rx, c in self.LEVELS:
             if rx.search(msg):
                 color = c
                 break
+        attrs = [self.pal(color)] * len(msg)
         m = self.HTTP_CODE.search(msg)
         if m:
             code = int(m.group(1))
             cc = RED if code >= 500 else YELLOW if code >= 400 else GREEN if code < 300 else BLUE
-            self.segs(y, x, [(msg[:m.start()], color), (m.group(1), cc, True), (msg[m.end():], color)], maxx)
-        else:
-            self.put(y, x, msg, self.pal(color), maxx)
+            attrs[m.start():m.end()] = [self.pal(cc) | BOLD] * (m.end() - m.start())
+        if find:
+            hit, low, f = self.pal(BASE, YELLOW) | BOLD, msg.lower(), find.lower()
+            i = low.find(f)
+            while i >= 0 and i < len(msg):
+                n = min(len(f), len(msg) - i)
+                attrs[i:i + n] = [hit] * n
+                i = low.find(f, i + len(f))
+        i = 0
+        while i < len(msg):
+            j = i + 1
+            while j < len(msg) and attrs[j] == attrs[i]:
+                j += 1
+            x += self.put(y, x, msg[i:j], attrs[i], maxx)
+            i = j
 
     def tab_info(self, r, y, x, h, w):
         ins = self.cache.get(("inspect", r["id"]), lambda: api("GET", f"/containers/{r['id']}/json"), 10)
@@ -2769,6 +2849,11 @@ class UI:
             # bottom-right corner, only when it doesn't cover anything
             if x + 2 <= vx:
                 self.put(y, vx, ver, self.pal(FAINT, BAR_BG))
+        if self.log_typing:
+            self.segs(y, 1, [(" f ", BASE), ], bg=YELLOW)
+            self.segs(y, 5, [("find in logs: ", SUB), (self.log_find, TEXT, True), ("▏", YELLOW),
+                             ("   enter keeps it · esc clears · only matching lines are shown", DIM)], w - 1, BAR_BG)
+            return
         if self.typing:
             self.segs(y, 1, [(" / ", BASE), ], bg=MAUVE)
             self.segs(y, 5, [("filter: ", SUB), (self.filter, TEXT, True), ("▏", MAUVE), ("   enter applies · esc clears", DIM)], w - 1, BAR_BG)
@@ -2785,6 +2870,8 @@ class UI:
             version(x)
             return
         keys = {
+            "logs": [("↑↓", "move"), ("f", "find"), ("w", "warn/errors"), ("H", "3000 lines" if self.log_tail == 300 else "300 lines"),
+                     ("PgUp/Dn", "scroll"), ("End", "follow"), ("←→", "tabs"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
             "project": [("↑↓", "move"), ("s", "start/stop all"), ("r", "restart all"), ("p", "pause all"), ("x", "down"),
                         ("u", "up -d"), ("/", "filter"), ("a", "stopped"), ("?", "help"), ("q", "quit")],
             0: [("↑↓", "move"), ("←→", "tabs"), ("s", "start/stop"), ("r", "restart"), ("p", "pause"), ("e", "shell"),
@@ -2792,7 +2879,8 @@ class UI:
             1: [("↑↓", "move"), ("p", "pull"), ("r", "run"), ("x", "delete"), ("P", "prune dangling"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
             2: [("↑↓", "move"), ("x", "delete"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
             3: [("↑↓", "move"), ("x", "remove"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
-        }["project" if self.view == 0 and self.current and "_group" in self.current else self.view]
+        }["project" if self.view == 0 and self.current and "_group" in self.current else
+          "logs" if self.view == 0 and self.tab == 1 and self.current else self.view]
         x = 1
         for key, desc in keys:
             if x + len(key) + len(desc) + 3 >= vx - 1:
@@ -3011,6 +3099,11 @@ class UI:
         [("  C         ", BLUE, True), ("clear events panel ", SUB), ("p       ", BLUE, True), ("pull an image (images view)", SUB)],
         [("            ", BLUE, True), ("                   ", SUB), ("r       ", BLUE, True), ("run a container (images view)", SUB)],
         [("  mouse     ", BLUE, True), ("click selects, wheel scrolls, click the tabs", SUB)],
+        [],
+        [("LOGS TAB", MAUVE, True)],
+        [("  f         ", BLUE, True), ("find: only lines   ", SUB), ("w       ", BLUE, True), ("all → warnings+errors → errors", SUB)],
+        [("            ", BLUE), ("with that text     ", SUB), ("H       ", BLUE, True), ("last 3000 lines instead of 300", SUB)],
+        [("  esc       ", BLUE, True), ("clears find and level · same as docker logs … 2>&1 | grep -i text", SUB)],
         [],
         [("COMPOSE PROJECTS", MAUVE, True), ("  select the ▾ project row, then:", DIM)],
         [("  s         ", BLUE, True), ("stop / start all   ", SUB), ("r       ", BLUE, True), ("restart all (docker compose restart)", SUB)],
