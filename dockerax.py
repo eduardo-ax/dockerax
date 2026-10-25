@@ -966,7 +966,8 @@ class UI:
         a baseline and a time axis. Falls back to the plain graph when there's no room.
         unit: round the scale in these units (1024**2 for memory gives 20M, 40M… ticks)."""
         data = list(data)
-        seen = [v for v in data if v is not None]
+        # only what fits on screen counts (axis labels take ~7 columns)
+        seen = [v for v in data[-(max(1, w - 7) * (1 if self.blocks else 2)):] if v is not None]
         peak = max(seen or [0])
         ph = h - (1 if base else 0) - (1 if times else 0)
         nt = 2 if ph < 6 else 3 if ph < 10 else 4
