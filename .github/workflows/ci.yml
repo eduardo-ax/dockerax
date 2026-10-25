@@ -13,8 +13,8 @@ jobs:
       matrix:
         python: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Compile
@@ -28,8 +28,8 @@ jobs:
     name: Minimum Python version (3.8)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
       # catches newer standard library calls that compile fine but fail on old Pythons
@@ -45,7 +45,7 @@ jobs:
       matrix:
         image: ["ubuntu:20.04", "ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04", "debian:12", "debian:13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install python3 from the distro
         run: apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null
       - run: python3 --version
@@ -59,7 +59,7 @@ jobs:
     name: Dashboard smoke test (real Docker)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Start a container to look at
         run: docker run -d --name ci-nginx -p 8080:80 nginx:alpine
       - name: Open the dashboard, visit every view, quit
