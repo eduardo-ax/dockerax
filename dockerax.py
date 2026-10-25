@@ -9,6 +9,7 @@ always the equivalent `docker` command for every action.
 Press ? inside the program for shortcuts and what every number means.
 """
 import curses
+import errno
 import http.client
 import json
 import locale
@@ -121,10 +122,13 @@ class UnixHTTP(http.client.HTTPConnection):
         self.sock = s
 
 
-def api(method, url, timeout=15):
+def api(method, url, timeout=15, body=None):
     conn = UnixHTTP(SOCK, timeout)
     try:
-        conn.request(method, url)
+        if body is None:
+            conn.request(method, url)
+        else:
+            conn.request(method, url, json.dumps(body), {"Content-Type": "application/json"})
         resp = conn.getresponse()
         body = resp.read()
         if resp.status >= 400:
@@ -297,6 +301,54 @@ def docker_run_cmd(ins):
         parts.append(f"--cpus {hc['NanoCpus'] / 1e9:g}")
     parts.append(cfg.get("Image", "?"))
     return " ".join(parts)
+
+
+RESTARTS = ["no", "unless-stopped", "always", "on-failure"]
+RUN_FIELDS = ["name", "host", "cport", "mode", "rm", "restart"]
+RUN_HINTS = {
+    "name": "--name: a fixed name to use in other commands (docker logs NAME). Empty = docker picks a random one.",
+    "host": "-p HOST:CONTAINER · the port opened on this machine. Empty = not published (only reachable from docker networks).",
+    "cport": "the port the app listens on inside the container. The image's EXPOSE tells you which one.",
+    "mode0": "-d (detached): runs in the background and gives the terminal back. Right for servers like nginx.",
+    "mode1": "-it (interactive): attaches your keyboard to it. For shells (ubuntu, python). Leaves dockerax until it exits.",
+    "rm": "--rm: delete the container automatically when it stops. Great for tests: no leftovers in docker ps -a.",
+    "restart0": "--restart no: if it stops or the machine reboots, it stays stopped.",
+    "restart1": "--restart unless-stopped: comes back after crashes and reboots, unless you stopped it yourself.",
+    "restart2": "--restart always: comes back after crashes and reboots, even if you had stopped it.",
+    "restart3": "--restart on-failure: restarts only when it exits with an error (exit code ≠ 0).",
+}
+
+
+def port_user(port, rows):
+    """Who already holds this host port: a container name, 'another program' or None."""
+    for r in rows:
+        for p in r["port_list"]:
+            if p.get("PublicPort") == port:
+                return r["name"]
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("", port))
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            return "another program"
+    finally:
+        s.close()
+    return None
+
+
+def run_argv(f):
+    """The docker run command the run form stands for."""
+    a = ["docker", "run", "-d" if f["mode"] == 0 else "-it"]
+    if f["rm"]:
+        a.append("--rm")
+    if f["name"]:
+        a += ["--name", f["name"]]
+    if f["host"] and f["cport"]:
+        a += ["-p", f"{f['host']}:{f['cport']}"]
+    if f["restart"]:
+        a += ["--restart", RESTARTS[f["restart"]]]
+    a.append(f["ref"])
+    return a
 
 
 def wrap(text, width):
@@ -734,6 +786,9 @@ class UI:
         self.help = False
         self.help_scroll = 0
         self.confirm = None   # (question, command, callback)
+        self.form = None      # run form state (images view, r)
+        self.goto = None      # container id to select once it shows up
+        self.rows = []
         self.msg = None       # (text, color, command, t)
         self.pending = set()  # ids with an action in progress
         self.logs = None
@@ -977,10 +1032,136 @@ class UI:
         curses.curs_set(0)
         self.flash(f"back from {n} shell", BLUE, f"docker exec -it {n} sh")
 
+    # ------------------------------------------------------------ run form
+    def open_run(self, item):
+        ref = item["tag"] if not item["dangling"] else item["short"]
+        self.form = {"img": item, "ref": ref, "name": "", "host": "", "cport": "", "mode": 0, "rm": False,
+                     "restart": 0, "focus": 0, "auto": True, "err": None, "chk": None}
+
+    def form_check(self):
+        """Validate the form; returns an error message or None."""
+        f = self.form
+        if f["name"]:
+            if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", f["name"]):
+                return "name: letters, digits, _ . - only (and not starting with a symbol)"
+            if any(r["name"] == f["name"] for r in self.rows):
+                return f"a container named {f['name']} already exists"
+        if f["host"]:
+            if not f["cport"]:
+                return "say which container port the host port leads to"
+            if not 0 < int(f["host"]) < 65536 or not re.fullmatch(r"\d{1,5}(/(tcp|udp|sctp))?", f["cport"]):
+                return "ports go from 1 to 65535 (container port may end in /udp)"
+            who = self.host_port_user()
+            if who:
+                return f"host port {f['host']} is already used by {who}"
+        return None
+
+    def host_port_user(self):
+        f = self.form
+        if not f["host"]:
+            return None
+        if not f["chk"] or f["chk"][0] != f["host"]:
+            f["chk"] = (f["host"], port_user(int(f["host"]), self.rows))
+        return f["chk"][1]
+
+    def form_key(self, k):
+        f = self.form
+        field = RUN_FIELDS[f["focus"]]
+        f["err"] = None
+        if k == 27:
+            self.form = None
+            self.flash("cancelled", DIM)
+        elif k in (10, 13, curses.KEY_ENTER):
+            self.submit_run()
+        elif k in (9, curses.KEY_DOWN):
+            f["focus"] = (f["focus"] + 1) % len(RUN_FIELDS)
+        elif k in (curses.KEY_BTAB, curses.KEY_UP):
+            f["focus"] = (f["focus"] - 1) % len(RUN_FIELDS)
+        elif field in ("name", "host", "cport"):
+            if k in (curses.KEY_BACKSPACE, 127, 8):
+                f[field] = f[field][:-1]
+            elif 32 < k < 127:
+                ch = chr(k)
+                ok = {"name": r"[a-zA-Z0-9_.-]", "host": r"\d", "cport": r"[\d/a-z]"}[field]
+                if re.fullmatch(ok, ch) and len(f[field]) < (40 if field == "name" else 9):
+                    f[field] += ch
+            if field == "cport":
+                f["auto"] = False
+        elif k in (32, curses.KEY_LEFT, curses.KEY_RIGHT):
+            d = -1 if k == curses.KEY_LEFT else 1
+            if field == "mode":
+                f["mode"] = (f["mode"] + d) % 2
+            elif field == "rm":
+                f["rm"] = not f["rm"]
+                if f["rm"]:
+                    f["restart"] = 0   # docker refuses --rm together with --restart
+            elif field == "restart":
+                f["restart"] = (f["restart"] + d) % len(RESTARTS)
+                if f["restart"]:
+                    f["rm"] = False
+
+    def submit_run(self):
+        f = self.form
+        err = self.form_check()
+        if err:
+            f["err"] = err
+            return
+        self.form = None
+        argv = run_argv(f)
+        cli = " ".join(argv)
+        if f["mode"] == 1:
+            return self.run_interactive(argv, f["ref"])
+        body = {"Image": f["ref"], "HostConfig": {"AutoRemove": f["rm"], "RestartPolicy": {"Name": RESTARTS[f["restart"]]}}}
+        if f["host"]:
+            cp = f["cport"] if "/" in f["cport"] else f["cport"] + "/tcp"
+            body["ExposedPorts"] = {cp: {}}
+            body["HostConfig"]["PortBindings"] = {cp: [{"HostPort": f["host"]}]}
+        url = "/containers/create" + (f"?name={quote(f['name'])}" if f["name"] else "")
+        self.flash(f"running… {cli}", BLUE)
+
+        def work():
+            try:
+                cid = api("POST", url, timeout=60, body=body)["Id"]
+                try:
+                    api("POST", f"/containers/{cid}/start", timeout=60)
+                except RuntimeError:
+                    # docker run would leave a dead "created" container behind; don't
+                    api("DELETE", f"/containers/{cid}?force=1")
+                    raise
+                self.goto, self.filter = cid, ""
+                self.set_view(0)
+                self.set_tab(1)
+                self.flash("✓ container started · showing its logs", GREEN, cli)
+            except Exception as e:  # noqa: BLE001
+                self.flash(f"✗ {e}", RED, cli)
+            self.cache.invalidate()
+            self.col.wake.set()
+        threading.Thread(target=work, daemon=True).start()
+
+    def run_interactive(self, argv, ref):
+        curses.def_prog_mode()
+        curses.endwin()
+        cli = " ".join(argv)
+        print(f"\n\033[1;38;5;183m$ {cli}\033[0m   \033[2m(exit or Ctrl+C to return to dockerax)\033[0m\n")
+        try:
+            rc = subprocess.call(argv)
+        except KeyboardInterrupt:
+            rc = 130
+        if rc not in (0, 130):
+            input(f"\n\033[2m(exited with code {rc}) press enter to return\033[0m")
+        curses.reset_prog_mode()
+        self.scr.clear()
+        curses.curs_set(0)
+        self.flash(f"back from {ref}", BLUE, cli)
+        self.cache.invalidate()
+        self.col.wake.set()
+
     def resource_action(self, item, key):
         if self.view == 1:
             ref = item["tag"] if item["tag"] != "<none>:<none>" else item["short"]
-            if key == "x":
+            if key == "r":
+                self.open_run(item)
+            elif key == "x":
                 if item["used"]:
                     self.flash(f"{ref} is used by {item['used']} container(s) — remove them first", YELLOW)
                     return
@@ -1029,6 +1210,9 @@ class UI:
             elif 32 <= k < 0x110000:
                 self.filter += chr(k)
             self.sel[self.view], self.sel_key[self.view] = 0, None
+            return True
+        if self.form:
+            self.form_key(k)
             return True
         if self.confirm:
             q, cli, fn = self.confirm
@@ -1136,7 +1320,7 @@ class UI:
                 self.set_tab(3)
             elif ch in ("s", "r", "p", "x", "e") and self.current:
                 self.container_action(self.current, ch)
-        elif ch in ("x", "P") and (self.current or ch == "P"):
+        elif ch in ("x", "P", "r") and (self.current or ch == "P") and (ch != "r" or self.view == 1):
             self.resource_action(self.current, ch)
         return True
 
@@ -1151,6 +1335,8 @@ class UI:
             d = -3 if up else 3
             if self.help:
                 self.help_scroll = max(0, self.help_scroll + d)
+                return True
+            if self.form:
                 return True
             y0, y1 = self.regions.get("detail", (-1, -1))
             if y0 <= my < y1 and self.view == 0 and self.tab:
@@ -1181,6 +1367,9 @@ class UI:
             self.scr.refresh()
             return
         rows, host, hh = self.snapshot()
+        self.rows = rows
+        if self.goto and any(r["id"] == self.goto for r in rows):
+            self.sel_key[0], self.goto = self.goto, None
         self.current = None
         self.draw_header(rows)
         host_h = 0 if self.zoom else (8 if h >= 38 else 6 if h >= 26 else 0)
@@ -1194,6 +1383,8 @@ class UI:
             self.draw_help()
         if self.confirm:
             self.draw_confirm()
+        if self.form:
+            self.draw_run()
         self.scr.refresh()
 
     def draw_header(self, rows):
@@ -1778,7 +1969,7 @@ class UI:
         sel = None
         if tbl_h >= 4:
             sel = self.table(y0, 0, tbl_h, self.w, "images", cols, items, self.image_cell,
-                             right=f"{len(items)} image{'s' if len(items) != 1 else ''} · {human(total)}  ·  x delete · P prune dangling")
+                             right=f"{len(items)} image{'s' if len(items) != 1 else ''} · {human(total)}  ·  r run · x delete · P prune")
             self.loading(y0, data, items)
         elif items:
             sel = items[min(self.sel[1], len(items) - 1)]
@@ -2040,7 +2231,7 @@ class UI:
         keys = {
             0: [("↑↓", "move"), ("←→", "tabs"), ("s", "start/stop"), ("r", "restart"), ("p", "pause"), ("e", "shell"),
                 ("x", "remove"), ("l", "logs"), ("/", "filter"), ("c/m/n", "sort"), ("a", "stopped"), ("?", "help"), ("q", "quit")],
-            1: [("↑↓", "move"), ("x", "delete"), ("P", "prune dangling"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
+            1: [("↑↓", "move"), ("r", "run"), ("x", "delete"), ("P", "prune dangling"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
             2: [("↑↓", "move"), ("x", "delete"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
             3: [("↑↓", "move"), ("x", "remove"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
         }[self.view]
@@ -2081,6 +2272,84 @@ class UI:
         self.hit(y + 5, x + 3, x + 11, lambda: (setattr(self, "confirm", None), fn()))
         self.hit(y + 5, x + 14, x + 22, lambda: setattr(self, "confirm", None))
 
+    def draw_run(self):
+        f = self.form
+        img = f["img"]
+        if f["auto"]:
+            ins = self.cache.get(("image", img["id"]), lambda: api("GET", f"/images/{quote(img['id'], safe='')}/json"), 300)
+            if isinstance(ins, dict) or isinstance(ins, Exception):
+                f["auto"] = False
+                exposed = sorted(((ins.get("Config") or {}).get("ExposedPorts") or {}) if isinstance(ins, dict) else {})
+                f["exposed"] = exposed
+                if exposed:
+                    num, _, proto = exposed[0].partition("/")
+                    f["cport"] = num + (f"/{proto}" if proto not in ("", "tcp") else "")
+                    cand = 8080 if int(num) < 1024 else int(num)
+                    while port_user(cand, self.rows) and cand < 65535:
+                        cand += 1
+                    f["host"] = str(cand)
+        y, x, h, w = self.modal(17, 76, f"run {f['ref']}", GREEN)
+        lx, vx, mx = x + 3, x + 15, x + w - 2
+        fy = {"name": y + 2, "host": y + 3, "cport": y + 3, "mode": y + 4, "rm": y + 5, "restart": y + 6}
+        focus = RUN_FIELDS[f["focus"]]
+        for name, label in (("name", "name"), ("host", "ports"), ("mode", "mode"), ("rm", "--rm"), ("restart", "restart")):
+            on = focus == name or (name == "host" and focus == "cport")
+            yy = fy[name]
+            self.segs(yy, lx - 2, [("▸ " if on else "  ", GREEN, True), (label, TEXT if on else SUB, on)], mx, BASE)
+            self.hit(yy, x + 1, x + w - 1, lambda n=name: f.__setitem__("focus", RUN_FIELDS.index(n)))
+
+        def field(yy, xx, key, placeholder):
+            on = focus == key
+            if f[key]:
+                xx = self.segs(yy, xx, [(f[key], TEXT, True)], mx, BASE)
+            elif not on:
+                xx = self.segs(yy, xx, [(placeholder, FAINT)], mx, BASE)
+            if on:
+                xx = self.segs(yy, xx, [("▏", GREEN, True)], mx, BASE)
+            return xx
+
+        field(fy["name"], vx, "name", "(random)")
+        xx = field(fy["host"], vx, "host", "host")
+        xx = self.segs(fy["host"], xx + 1, [("→ ", MAUVE, True)], mx, BASE)
+        self.hit(fy["host"], xx, mx, lambda: f.__setitem__("focus", RUN_FIELDS.index("cport")))
+        xx = field(fy["host"], xx, "cport", "container")
+        exposed = f.get("exposed")
+        if f["host"]:
+            who = self.host_port_user()
+            self.segs(fy["host"], xx + 3, [(f"✗ {f['host']} in use by {who}", RED)] if who else [("✓ free", GREEN)], mx, BASE)
+        elif exposed is not None:
+            self.segs(fy["host"], xx + 3, [("not published", DIM)], mx, BASE)
+        modes = [("detached", "-d"), ("interactive", "-it")]
+        xx = vx
+        for i, (m, flag) in enumerate(modes):
+            sel = f["mode"] == i
+            xx = self.segs(fy["mode"], xx, [("● " if sel else "○ ", GREEN if sel else DIM, True), (m, TEXT if sel else SUB, sel),
+                                            (f" {flag}   ", DIM)], mx, BASE)
+        self.segs(fy["rm"], vx, [("☑ " if f["rm"] else "☐ ", GREEN if f["rm"] else DIM, True),
+                                 ("delete when it stops" if f["rm"] else "keep it after it stops", SUB)], mx, BASE)
+        xx = vx
+        for i, r in enumerate(RESTARTS):
+            sel = f["restart"] == i
+            xx = self.segs(fy["restart"], xx, [(r, BASE if sel else SUB, sel)], mx, GREEN if sel else BASE)
+            xx += 2
+        hint = RUN_HINTS.get(focus) or RUN_HINTS[f"{focus}{f[focus]}"]
+        if focus == "cport" and exposed:
+            hint = f"the port the app listens on inside the container. This image exposes {', '.join(exposed)}."
+        elif focus == "cport" and exposed == []:
+            hint = "the port the app listens on inside the container. This image declares no EXPOSE: check its docs."
+        for i, line in enumerate(wrap(hint, w - 6)[:2]):
+            self.segs(y + 8 + i, lx, [(line, SKY)], mx, BASE)
+        lines = wrap(" ".join(run_argv(f)), w - 10)[:3]
+        for i, line in enumerate(lines):
+            self.segs(y + 11 + i, lx, [("$ " if i == 0 else "  ", MAUVE, True), (line, TEXT, True),
+                                       (" \\" if i < len(lines) - 1 else "", DIM)], mx, BASE)
+        if f["err"]:
+            self.segs(y + h - 2, lx, [("✗ " + f["err"], RED, True)], mx, BASE)
+        keys = " enter run · tab next · space/←→ change · esc cancel "
+        kx = x + max(2, w - len(keys) - 3)
+        self.put(y + h - 1, kx, keys, self.pal(DIM, BASE), mx)
+        self.hit(y + h - 1, kx, kx + 11, self.submit_run)
+
     HELP = [
         [("SHORTCUTS", MAUVE, True)],
         [("  1 2 3 4   ", BLUE, True), ("containers · images · volumes · networks  (or click the top bar)", SUB)],
@@ -2092,7 +2361,7 @@ class UI:
         [("  z         ", BLUE, True), ("enlarge the panel  ", SUB), ("/       ", BLUE, True), ("filter by name", SUB)],
         [("  c m n     ", BLUE, True), ("sort cpu/mem/name  ", SUB), ("a       ", BLUE, True), ("show/hide stopped", SUB)],
         [("  b         ", BLUE, True), ("solid/transparent  ", SUB), ("g       ", BLUE, True), ("block / braille graphs", SUB)],
-        [("  C         ", BLUE, True), ("clear the events panel", SUB)],
+        [("  C         ", BLUE, True), ("clear the events panel ", SUB), ("r       ", BLUE, True), ("run a container (images view)", SUB)],
         [("  mouse     ", BLUE, True), ("click selects, wheel scrolls, click the tabs", SUB)],
         [],
         [("WHAT THE NUMBERS MEAN", MAUVE, True)],

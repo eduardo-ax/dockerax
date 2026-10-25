@@ -50,6 +50,10 @@ cd dockerax
 
 ![images view with layers](docs/images.png)
 
+**Run** — press `r` on an image: pick a name, ports, detached or interactive, `--rm` and a restart policy. Every field explains its flag and the `docker run` command builds itself as you type.
+
+![run form with the docker run preview](docs/run.png)
+
 **Logs** — live `docker logs -f` of the selected container, with stderr marked and levels colored.
 
 ![logs tab](docs/logs.png)
@@ -66,10 +70,11 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
   - **info** — restart policy, command, health, ports explained in plain words with a URL, networks with IPs, mounts, env vars (secrets masked) and an approximate `docker run` command that would recreate it.
   - **processes** — `docker top`, sorted by CPU.
 - **Images** — size bars, in-use count, dangling images and image **layers**.
+- **Run a container from an image** (`r` in the images view) — a small form: name, host → container port (suggested from the image's `EXPOSE`, with a check that the host port is free), detached (`-d`) or interactive (`-it`), `--rm` and restart policy. Each field explains its flag, and the matching `docker run` command updates as you type.
 - **Volumes** — size, which containers mount each volume and where.
 - **Networks** — subnet, gateway and the **network map** described above.
 - **Live events** — Docker's event stream described in words.
-- **Actions** — start/stop, restart, pause, remove, open a shell inside a container, delete images/volumes/networks, prune dangling images. Destructive actions ask for confirmation (`y`), and every action shows the equivalent `docker` command.
+- **Actions** — run a container from an image, start/stop, restart, pause, remove, open a shell inside a container, delete images/volumes/networks, prune dangling images. Destructive actions ask for confirmation (`y`), and every action shows the equivalent `docker` command.
 - **Mouse** — click rows, tabs and views; the wheel scrolls.
 - Solid or transparent background, block or braille graphs — both remembered between runs.
 
@@ -94,6 +99,7 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
 | `r` | restart |
 | `p` | pause / resume |
 | `x` | remove (stopped container, image, volume, network) |
+| `r` (images view) | run a container from the selected image |
 | `P` | prune dangling images (images view) |
 | `e` | open a shell in the container (`docker exec -it … sh`) |
 | `l` `i` `t` | logs / info / processes tab |
