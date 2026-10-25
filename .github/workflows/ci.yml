@@ -39,21 +39,32 @@ jobs:
   distro:
     name: ${{ matrix.image }} (system python3)
     runs-on: ubuntu-latest
-    container: ${{ matrix.image }}
     strategy:
       fail-fast: false
       matrix:
-        image: ["ubuntu:20.04", "ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04", "debian:12", "debian:13"]
+        include:
+          - { image: "ubuntu:20.04", install: "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3" }
+          - { image: "ubuntu:22.04", install: "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3" }
+          - { image: "ubuntu:24.04", install: "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3" }
+          - { image: "ubuntu:26.04", install: "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3" }
+          - { image: "debian:12", install: "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3" }
+          - { image: "debian:13", install: "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3" }
+          - { image: "fedora:latest", install: "dnf install -y -q python3" }
+          - { image: "archlinux:latest", install: "pacman -Sy --noconfirm --quiet python" }
+          - { image: "alpine:latest", install: "apk add --no-cache -q python3" }
+          # openSUSE ships Python's curses module as a separate package
+          - { image: "opensuse/tumbleweed:latest", install: "zypper -q -n install python3 python3-curses" }
     steps:
       - uses: actions/checkout@v5
-      - name: Install python3 from the distro
-        run: apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null
-      - run: python3 --version
-      - name: Compile and run the command-line options
+      - name: Install the distro's python3, compile and run the command-line options
+        # dockerax imports curses at the top, so --version also proves curses is there
         run: |
-          python3 -m py_compile dockerax.py
-          python3 dockerax.py --version
-          python3 dockerax.py --help
+          docker run --rm -v "$PWD":/src -w /src ${{ matrix.image }} sh -c '
+            ${{ matrix.install }} >/dev/null &&
+            python3 --version &&
+            python3 -m py_compile dockerax.py &&
+            python3 dockerax.py --version &&
+            python3 dockerax.py --help >/dev/null'
 
   dashboard:
     name: Dashboard smoke test (real Docker)
