@@ -35,7 +35,7 @@ REPO = "eduardo-ax/dockerax"
 INTERVAL = 2.0
 HIST = 300
 FPS = 10
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 # palette (catppuccin mocha) — converted to 256 colors when drawing
 TEXT = (205, 214, 244)
