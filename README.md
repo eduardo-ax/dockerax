@@ -177,6 +177,10 @@ Constants at the top of `dockerax.py`: `INTERVAL` (seconds between polls, defaul
 - **Broken characters** — use a UTF-8 locale and a font with box-drawing and braille glyphs.
 - **An old version opens** — run `hash -r` or open a new shell; `type dockerax` shows which file runs.
 
+## Similar tools
+
+[lazydocker](https://github.com/jesseduffield/lazydocker), [ctop](https://github.com/bcicen/ctop) and [oxker](https://github.com/mrjackwills/oxker) are great terminal UIs for Docker too. dockerax focuses on *showing and explaining*: every action prints the equivalent `docker` command, and views like the network map, the compose start order and disk usage explain what Docker is doing — all in a single Python file with no dependencies.
+
 ## License
 
 [MIT](LICENSE)
