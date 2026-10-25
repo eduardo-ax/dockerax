@@ -11,6 +11,7 @@ Press ? inside the program for shortcuts and what every number means.
 import curses
 import errno
 import http.client
+import itertools
 import json
 import locale
 import math
@@ -919,59 +920,125 @@ class UI:
             run += ch
         self.put(y, cx, run, run_attr)
 
-    def graph(self, y, x, w, h, data, maxv, stops, bg=None, invert=False):
-        """Braille area graph: 2 samples per column, 4 levels per row."""
-        if w <= 0 or h <= 0:
-            return
-        if self.blocks:
-            return self.block_graph(y, x, w, h, data, maxv, stops, bg, invert)
-        vals = list(data)[-(w * 2):]
-        vals = [None] * (w * 2 - len(vals)) + vals
-        top = h * 4
-        lv = []
-        for v in vals:
-            if v is None or maxv <= 0:
-                lv.append(0)
-            else:
-                n = int(round(v / maxv * top))
-                lv.append(max(1 if v > 0 else 0, min(top, n)))
-        tl, tr = (BR_DN_L, BR_DN_R) if invert else (BR_UP_L, BR_UP_R)
-        for row in range(h):
-            base = row * 4 if invert else (h - 1 - row) * 4
-            chars = []
-            for cx in range(w):
-                a = max(0, min(4, lv[2 * cx] - base))
-                b = max(0, min(4, lv[2 * cx + 1] - base))
-                chars.append(chr(0x2800 | tl[a] | tr[b]) if a or b else " ")
-            t = (row + 0.5) / h if invert else (h - 1 - row + 0.5) / h
-            line = "".join(chars)
-            if line.strip() or bg is not None:
-                self.put(y + row, x, line, self.pal(grad(stops, t), bg))
-
-    def block_graph(self, y, x, w, h, data, maxv, stops, bg=None, invert=False):
-        """Same graph with solid blocks: 1 sample per column, 8 levels per row."""
-        vals = list(data)[-w:]
-        vals = [None] * (w - len(vals)) + vals
-        top = h * 8
+    def graph_rows(self, w, h, data, maxv, invert=False):
+        """Rows of text for an area graph: braille (2 samples per column, 4 levels per row)
+        or solid blocks (1 sample per column, 8 levels per row)."""
+        spc, lvls = (1, 8) if self.blocks else (2, 4)
+        vals = list(data)[-(w * spc):]
+        vals = [None] * (w * spc - len(vals)) + vals
+        top = h * lvls
         lv = []
         for v in vals:
             if v is None or maxv <= 0:
                 lv.append(0)
             else:
                 lv.append(max(1 if v > 0 else 0, min(top, int(round(v / maxv * top)))))
+        rows = []
         for row in range(h):
-            base = row * 8 if invert else (h - 1 - row) * 8
+            base = row * lvls if invert else (h - 1 - row) * lvls
             chars = []
-            for n in lv:
-                f = max(0, min(8, n - base))
-                if invert:
-                    chars.append("█" if f >= 8 else "▀" if f >= 4 else "▔" if f else " ")
-                else:
-                    chars.append(BLOCKS[f])
+            if self.blocks:
+                for n in lv:
+                    f = max(0, min(8, n - base))
+                    if invert:
+                        chars.append("█" if f >= 8 else "▀" if f >= 4 else "▔" if f else " ")
+                    else:
+                        chars.append(BLOCKS[f])
+            else:
+                tl, tr = (BR_DN_L, BR_DN_R) if invert else (BR_UP_L, BR_UP_R)
+                for cx in range(w):
+                    a = max(0, min(4, lv[2 * cx] - base))
+                    b = max(0, min(4, lv[2 * cx + 1] - base))
+                    chars.append(chr(0x2800 | tl[a] | tr[b]) if a or b else " ")
+            rows.append("".join(chars))
+        return rows
+
+    def graph(self, y, x, w, h, data, maxv, stops, bg=None, invert=False):
+        if w <= 0 or h <= 0:
+            return
+        for row, line in enumerate(self.graph_rows(w, h, data, maxv, invert)):
             t = (row + 0.5) / h if invert else (h - 1 - row + 0.5) / h
-            line = "".join(chars)
             if line.strip() or bg is not None:
                 self.put(y + row, x, line, self.pal(grad(stops, t), bg))
+
+    def chart(self, y, x, w, h, data, floor, stops, fmt, refs=(), invert=False, base=True, times=True, lw=None, unit=1):
+        """Graph with a value axis, faint grid lines, the peak reached, reference lines,
+        a baseline and a time axis. Falls back to the plain graph when there's no room.
+        unit: round the scale in these units (1024**2 for memory gives 20M, 40M… ticks)."""
+        data = list(data)
+        seen = [v for v in data if v is not None]
+        peak = max(seen or [0])
+        ph = h - (1 if base else 0) - (1 if times else 0)
+        nt = 2 if ph < 6 else 3 if ph < 10 else 4
+        # the smallest round scale above the peak, split into equal round steps
+        want = max(floor, peak * 1.15) / unit
+        n, step = min(((n, nice_ceil(want / n)) for n in range(max(2, nt - 1), nt + 2)), key=lambda c: c[0] * c[1])
+        maxv, step = n * step * unit, step * unit
+        if ph < 3 or w < 20:
+            self.graph(y, x, w, h, data, maxv, stops, invert=invert)
+            return
+        ticks = [step * i for i in range(1, n + 1)]
+        labels = [fmt(v) for v in ticks] + [fmt(peak) if peak else "0"]
+        lw = lw or min(8, max(len(t) for t in labels) + 1)
+        px, pw = x + lw + 1, w - lw - 1
+        gy = y + (1 if base and invert else 0)
+
+        def row_of(v):
+            r = int(round(v / maxv * ph))
+            return max(0, min(ph - 1, r - 1 if invert else ph - r))
+
+        over = {}   # row -> (char, color, label)
+        for v in ticks:
+            over[row_of(v)] = ("┈", FAINT, "")
+        for v, text in refs:
+            if 0 < v < maxv:
+                over[row_of(v)] = ("┈", DIM, text)
+        pcol = grad(stops, min(1.0, peak / maxv)) if maxv else DIM
+        if peak > 0:
+            over[row_of(peak)] = ("┈", pcol, "")
+        rows = self.graph_rows(pw, ph, data, maxv, invert)
+        for r, line in enumerate(rows):
+            yy = gy + r
+            t = (r + 0.5) / ph if invert else (ph - 1 - r + 0.5) / ph
+            bar = grad(stops, t)
+            ov = over.get(r)
+            # each cell is a bar, an overlay line (grid/peak/reference) or the reference's label
+            cells = [("bar", ch) if ch != " " or not ov else ("over", ov[0]) for ch in line]
+            if ov and ov[2]:
+                for k, ch in enumerate(f" {ov[2]} "):
+                    if 1 + k < pw and cells[1 + k][0] == "over":
+                        cells[1 + k] = ("label", ch)
+            cx = px
+            for kind, grp in itertools.groupby(cells, key=lambda c: c[0]):
+                run = "".join(c[1] for c in grp)
+                if kind != "bar" or run.strip():
+                    self.put(yy, cx, run, self.pal(bar if kind == "bar" else ov[1]))
+                cx += len(run)
+            self.put(yy, px - 1, "┤" if r in over else "│", self.pal(FAINT))
+        for v in ticks:
+            self.put(gy + row_of(v), x, f"{fmt(v):>{lw - 1}}", self.pal(FAINT))
+        for v, _ in refs:
+            if 0 < v < maxv and row_of(v) not in map(row_of, ticks):
+                self.put(gy + row_of(v), x, f"{fmt(v):>{lw - 1}}", self.pal(DIM))
+        if peak > 0:
+            self.put(gy + row_of(peak), x, f"{fmt(peak):>{lw - 1}}", self.pal(pcol) | BOLD)
+        if base:
+            by = y if invert else gy + ph
+            spc = 1 if self.blocks else 2
+            filled = len(data[-(pw * spc):])
+            have = (filled + spc - 1) // spc
+            self.put(by, x, f"{'0':>{lw - 1}}", self.pal(FAINT))
+            self.segs(by, px - 1, [("┌" if invert else "└", FAINT), ("┈" * (pw - have), FAINT), ("─" * have, DIM)])
+        if times and pw >= 18:
+            ty = y + h - 1
+            span = pw * (1 if self.blocks else 2) * INTERVAL
+
+            def dur(sec):
+                return f"-{sec / 60:.0f}m" if sec >= 120 else f"-{sec:.0f}s"
+            self.put(ty, px, dur(span), self.pal(FAINT))
+            mid = dur(span / 2)
+            self.put(ty, px + (pw - len(mid)) // 2, mid, self.pal(FAINT))
+            self.put(ty, px + pw - 3, "now", self.pal(FAINT))
 
     def ease(self, key, target, k=0.35):
         v = self.ease_vals.get(key, target)
@@ -1830,27 +1897,42 @@ class UI:
         gh = max(1, h - 2)
         ncpu = os.cpu_count() or 1
         panels = []
+
+        def stats(data, fmt):
+            vals = [v for v in data if v is not None]
+            return f"peak {fmt(max(vals))} · avg {fmt(sum(vals) / len(vals))}" if vals else ""
+
+        def pct(v):
+            return f"{v:.0f}%"
+
+        def size(v):
+            return re.sub(r"\.0(?=[A-Z])", "", human(v)) if v else "0"
         cpu = self.ease("d.cpu", r["cpu"])
         panels.append(([("CPU ", SUB, True), (f"{cpu:.1f}%", grad(G_LOAD, cpu / 100), True),
-                        (f"  ≈ {cpu / 100:.2f} of {ncpu} cores", DIM)],
-                       lambda gx, gy: self.graph(gy, gx, gw, gh, hist["cpu"], max(100.0, max(hist["cpu"] or [0]) * 1.2), G_LOAD)))
+                        (f"  ≈ {cpu / 100:.2f} of {ncpu} cores", DIM)], stats(hist["cpu"], pct),
+                       lambda gx, gy: self.chart(gy, gx, gw, gh, hist["cpu"], 100, G_LOAD, pct, refs=[(100, "1 core")])))
         lim = r["mem_limit"]
-        # scale with a 64M floor and a round value: steady usage becomes a low band, not a tower
-        mscale = nice_ceil(max(64 * 1024 ** 2, max(hist["mem"] or [0]) * 1.25) / 1024 ** 2) * 1024 ** 2
-        panels.append(([("MEMORY ", SUB, True), (human(r["mem"]), MAUVE, True), (f" of {human(lim)}" if lim else "", DIM),
-                        (f"  scale 0–{human(mscale)}", FAINT)],
-                       lambda gx, gy: self.graph(gy, gx, gw, gh, hist["mem"], mscale, G_MEM)))
+        panels.append(([("MEMORY ", SUB, True), (human(r["mem"]), MAUVE, True), (f" of {human(lim)}" if lim else "", DIM)],
+                       stats(hist["mem"], human),
+                       # 64M floor: steady usage becomes a low band, not a tower
+                       lambda gx, gy: self.chart(gy, gx, gw, gh, hist["mem"], 64 * 1024 ** 2, G_MEM, size,
+                                                 refs=[(lim, "limit")], unit=1024 ** 2)))
 
         def netg(gx, gy):
             top = (gh + 1) // 2
-            self.graph(gy, gx, gw, top, hist["rx"], max(10240, max(hist["rx"] or [0]) * 1.2), G_RX)
+            lw = 7
+            self.chart(gy, gx, gw, top, hist["rx"], 10240, G_RX, size, times=False, lw=lw, unit=1024)
             if gh - top:
-                self.graph(gy + top, gx, gw, gh - top, hist["tx"], max(10240, max(hist["tx"] or [0]) * 1.2), G_TX, invert=True)
+                self.chart(gy + top, gx, gw, gh - top, hist["tx"], 10240, G_TX, size, invert=True, base=False, lw=lw, unit=1024)
+            self.put(gy + top - 1, gx + lw + 2, " ↓ in ", self.pal(TEAL))
+            self.put(gy + top - 1, gx + lw + 8, " ↑ out ", self.pal(PEACH))
         panels.append(([("NET ", SUB, True), ("↓", TEAL), (human(r["rx_rate"], "/s"), TEXT, True),
-                        ("  ↑", PEACH), (human(r["tx_rate"], "/s"), TEXT, True)], netg))
-        for i, (label, draw) in enumerate(panels[:ncols]):
+                        ("  ↑", PEACH), (human(r["tx_rate"], "/s"), TEXT, True)], "", netg))
+        for i, (label, extra, draw) in enumerate(panels[:ncols]):
             gx = x + i * (gw + 3)
-            self.segs(y, gx, label, gx + gw)
+            end = self.segs(y, gx, label, gx + gw)
+            if extra and end + len(extra) + 2 <= gx + gw:
+                self.put(y, gx + gw - len(extra), extra, self.pal(DIM))
             draw(gx, y + 1)
             if i:
                 for yy in range(y, y + h - 1):

@@ -69,7 +69,7 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
 - **Host panel** — total CPU graph, per-core bars, load average, memory, swap, disk (of Docker's root dir) and host network traffic.
 - **Containers** — grouped by compose project as a tree; CPU sparkline, memory bar, network rates, status and ports per row; animated state icons (unhealthy blinks, restarting spins).
 - **Bottom panel tabs** for the selected container:
-  - **metrics** — CPU, memory and network (in/out mirrored) history graphs.
+  - **metrics** — CPU, memory and network (in/out mirrored) history graphs with a value axis, grid lines, the peak reached, reference lines (1 core, memory limit) and a time axis.
   - **logs** — live `docker logs -f`, stderr marked in red, log levels and HTTP status codes colored, scrollback.
   - **info** — restart policy, command, health, ports explained in plain words with a URL, networks with IPs, mounts, env vars (secrets masked) and an approximate `docker run` command that would recreate it.
   - **processes** — `docker top`, sorted by CPU.
