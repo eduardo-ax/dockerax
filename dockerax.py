@@ -21,14 +21,17 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
+REPO = "eduardo-ax/dockerax"
 INTERVAL = 2.0
 HIST = 300
 FPS = 10
@@ -2750,10 +2753,100 @@ def main(scr):
         ui.stop_logs()
 
 
+# ════════════════════════════════════════════════════════════ self update
+USAGE = """usage: dockerax [option]
+
+  (no option)    open the dashboard
+  --version, -V  print the version
+  --check        tell whether a newer release exists (needs internet)
+  --update       download the latest release over this file (needs internet)
+  --help, -h     this help"""
+
+
+def vtuple(v):
+    return tuple(int(n) for n in re.findall(r"\d+", v)[:3])
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": f"dockerax/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read()
+
+
+def latest_release():
+    """(version, notes) of the latest GitHub release."""
+    rel = json.loads(fetch(f"https://api.github.com/repos/{REPO}/releases/latest"))
+    return rel["tag_name"].lstrip("v"), rel.get("body") or ""
+
+
+def release_bullets(notes):
+    """The titles of the '- **Title** — …' lines of the release notes."""
+    out = []
+    for line in notes.splitlines():
+        if line.startswith("- "):
+            title = re.sub(r"\*\*|`", "", line[2:]).split(" — ")[0]
+            out.append("  • " + re.sub(r"\[([^]]*)\]\([^)]*\)", r"\1", title))
+    return out
+
+
+def self_update(check_only):
+    try:
+        latest, notes = latest_release()
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"couldn't reach GitHub: {e}")
+    if vtuple(latest) <= vtuple(VERSION):
+        newer = vtuple(latest) < vtuple(VERSION)
+        print(f"dockerax {VERSION} is " + (f"newer than the latest release ({latest})" if newer else "up to date"))
+        return
+    print(f"dockerax {VERSION} → {latest} available")
+    print("\n".join(release_bullets(notes)))
+    if check_only:
+        print("run dockerax --update to install it")
+        return
+    path = os.path.realpath(__file__)
+    folder = os.path.dirname(path)
+    if os.path.isdir(os.path.join(folder, ".git")):
+        sys.exit(f"{path} is a git checkout — update it with git pull")
+    if not os.access(folder, os.W_OK) or not os.access(path, os.W_OK):
+        sys.exit(f"no permission to replace {path} — run: sudo dockerax --update")
+    print(f"downloading v{latest}…")
+    try:
+        src = fetch(f"https://raw.githubusercontent.com/{REPO}/v{latest}/dockerax.py")
+        compile(src, "dockerax.py", "exec")
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"download failed, nothing changed: {e}")
+    m = re.search(rb'^VERSION = "([^"]+)"', src, re.M)
+    if not m or m.group(1).decode() != latest:
+        sys.exit("the downloaded file doesn't carry the expected version, nothing changed")
+    st = os.stat(path)
+    # write next to the old file and rename over it: never leaves a half-written program
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".dockerax-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(src)
+        os.chmod(tmp, st.st_mode & 0o7777)
+        if os.geteuid() == 0:
+            os.chown(tmp, st.st_uid, st.st_gid)
+        os.replace(tmp, path)
+    except OSError as e:
+        os.unlink(tmp)
+        sys.exit(f"couldn't replace {path}: {e}")
+    print(f"updated {path} to {latest}")
+
+
 if __name__ == "__main__":
-    if any(a in ("--version", "-V") for a in sys.argv[1:]):
+    args = sys.argv[1:]
+    if any(a in ("--help", "-h") for a in args):
+        print(USAGE)
+        sys.exit(0)
+    if any(a in ("--version", "-V") for a in args):
         print(f"dockerax {VERSION}")
         sys.exit(0)
+    if "--check" in args or "--update" in args:
+        self_update(check_only="--update" not in args)
+        sys.exit(0)
+    if args:
+        sys.exit(f"unknown option {args[0]}\n\n{USAGE}")
     if not os.access(SOCK, os.R_OK | os.W_OK):
         raise SystemExit(f"no access to {SOCK} (is the user in the docker group?)")
     locale.setlocale(locale.LC_ALL, "")
