@@ -1,5 +1,7 @@
 # dockerax
 
+[![CI](https://github.com/eduardo-ax/dockerax/actions/workflows/ci.yml/badge.svg)](https://github.com/eduardo-ax/dockerax/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/eduardo-ax/dockerax)](https://github.com/eduardo-ax/dockerax/releases/latest)
+
 A Docker dashboard for the terminal — live, visual and didactic.
 
 ![dockerax — containers view with live metrics](docs/containers.png)

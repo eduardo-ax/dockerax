@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m py_compile dockerax.py
+      - name: Run the command-line options
+        run: |
+          python dockerax.py --version
+          python dockerax.py --help
+
+  minimum:
+    name: Minimum Python version (3.8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      # catches newer standard library calls that compile fine but fail on old Pythons
+      - run: pip install vermin
+      - run: vermin --no-tips --violations -t=3.8- dockerax.py
+
+  distro:
+    name: ${{ matrix.image }} (system python3)
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:20.04", "ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04", "debian:12", "debian:13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install python3 from the distro
+        run: apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null
+      - run: python3 --version
+      - name: Compile and run the command-line options
+        run: |
+          python3 -m py_compile dockerax.py
+          python3 dockerax.py --version
+          python3 dockerax.py --help
+
+  dashboard:
+    name: Dashboard smoke test (real Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start a container to look at
+        run: docker run -d --name ci-nginx -p 8080:80 nginx:alpine
+      - name: Open the dashboard, visit every view, quit
+        run: |
+          # script gives dockerax a real terminal; the keys go through its stdin
+          (sleep 6; for k in 2 3 4 1 l i t; do printf "$k"; sleep 1; done; printf q) |
+            TERM=xterm-256color timeout 60 script -qec "python3 dockerax.py 2>err.log" /dev/null >/dev/null
+          if [ -s err.log ]; then cat err.log; exit 1; fi
+      - if: always()
+        run: docker rm -f ci-nginx
