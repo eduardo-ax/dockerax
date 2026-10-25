@@ -64,6 +64,10 @@ cd dockerax
 
 ![pull dialog with per-layer progress](docs/pull.png)
 
+**Disk** — what Docker takes on the disk (`docker system df`): images, containers, volumes and build cache, how much can be freed without touching anything in use, and exactly what each `x` (prune) would delete.
+
+![disk view with reclaimable space](docs/disk.png)
+
 **Logs** — live `docker logs -f` of the selected container, with stderr marked and levels colored. `f` finds text (only matching lines, highlighted), `w` shows only warnings/errors, and the matching `docker logs … 2>&1 | grep` command is shown.
 
 ![logs tab](docs/logs.png)
@@ -84,6 +88,7 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
 - **Pull images** (`p` in the images view) — type a name like `nginx:alpine`; it shows how the name breaks down (registry, user, name, tag — no tag means `latest`) and then live progress per layer, including layers that *already exist* because another image shares them. `Esc` cancels; when it finishes, `r` runs it.
 - **Run a container from an image** (`r` in the images view) — a small form: name, host → container port (suggested from the image's `EXPOSE`, with a check that the host port is free), detached (`-d`) or interactive (`-it`), `--rm` and restart policy. Each field explains its flag, and the matching `docker run` command updates as you type.
 - **Volumes** — size, which containers mount each volume and where.
+- **Disk** (`5`) — `docker system df` as a table: size and reclaimable space of images, containers, volumes and build cache, plus the docker total and free disk. The panel below lists what `x` would delete and what is kept (in use). `x` runs the matching prune after a confirmation and says how much was freed: `docker image prune -a`, `docker container prune`, `docker volume prune` (unused **anonymous** volumes only — named volumes are deleted one by one in the volumes view) and `docker builder prune`.
 - **Networks** — subnet, gateway and the **network map** described above.
 - **Live events** — Docker's event stream described in words.
 - **Actions** — pull images, run a container from an image, start/stop (also whole compose projects), restart, pause, remove, open a shell inside a container, delete images/volumes/networks, prune dangling images. Destructive actions ask for confirmation (`y`), and every action shows the equivalent `docker` command.
@@ -102,7 +107,7 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
 
 | Key | Action |
 |---|---|
-| `1` `2` `3` `4` | containers · images · volumes · networks |
+| `1` `2` `3` `4` `5` | containers · images · volumes · networks · disk |
 | `↑` `↓` / `j` `k` | select |
 | `←` `→` / `Tab` | switch the bottom tab (containers) or the view |
 | `PgUp` `PgDn` | scroll logs / info / processes |
@@ -113,7 +118,7 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
 | `s` | start / stop (on a compose project row: the whole project) |
 | `r` | restart |
 | `p` | pause / resume |
-| `x` | remove (stopped container, image, volume, network) · `docker compose down` on a project row |
+| `x` | remove (stopped container, image, volume, network) · `docker compose down` on a project row · prune in the disk view |
 | `u` | `docker compose up -d` (on a project row) |
 | `p` (images view) | pull an image (`docker pull`) |
 | `r` (images view) | run a container from the selected image |
