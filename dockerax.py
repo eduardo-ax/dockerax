@@ -2352,6 +2352,13 @@ class UI:
     def draw_footer(self):
         y, w = self.h - 1, self.w
         self.put(y, 0, " " * (w - 1), self.pal(SUB, BAR_BG))
+        ver = f"v{VERSION}"
+        vx = w - len(ver) - 2
+
+        def version(x):
+            # bottom-right corner, only when it doesn't cover anything
+            if x + 2 <= vx:
+                self.put(y, vx, ver, self.pal(FAINT, BAR_BG))
         if self.typing:
             self.segs(y, 1, [(" / ", BASE), ], bg=MAUVE)
             self.segs(y, 5, [("filter: ", SUB), (self.filter, TEXT, True), ("▏", MAUVE), ("   enter applies · esc clears", DIM)], w - 1, BAR_BG)
@@ -2364,7 +2371,8 @@ class UI:
             text, color, cmd, _ = self.msg
             x = self.segs(y, 1, [(f" {text} ", color, True)], w - 1, BAR_BG)
             if cmd:
-                self.segs(y, x + 2, [("same as ", DIM), ("$ ", MAUVE), (cmd, TEXT, True)], w - 1, BAR_BG)
+                x = self.segs(y, x + 2, [("same as ", DIM), ("$ ", MAUVE), (cmd, TEXT, True)], w - 1, BAR_BG)
+            version(x)
             return
         keys = {
             0: [("↑↓", "move"), ("←→", "tabs"), ("s", "start/stop"), ("r", "restart"), ("p", "pause"), ("e", "shell"),
@@ -2375,12 +2383,13 @@ class UI:
         }[self.view]
         x = 1
         for key, desc in keys:
-            if x + len(key) + len(desc) + 3 >= w - 2:
+            if x + len(key) + len(desc) + 3 >= vx - 1:
                 break
             x = self.segs(y, x, [(key, BLUE, True), (" " + desc + "  ", DIM)], w - 1, BAR_BG)
+        version(x)
         tip = "tip: " + TIPS[int(time.time() / 9) % len(TIPS)]
-        if w - x > len(tip) + 4:
-            self.put(y, w - len(tip) - 2, tip, self.pal(FAINT, BAR_BG))
+        if vx - x > len(tip) + 5:
+            self.put(y, vx - len(tip) - 3, tip, self.pal(FAINT, BAR_BG))
 
     def modal(self, h, w, title, color=MAUVE):
         h, w = min(h, self.h - 2), min(w, self.w - 4)
