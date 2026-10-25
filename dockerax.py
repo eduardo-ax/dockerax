@@ -1713,7 +1713,7 @@ class UI:
             cols = [("dot", "", 1), ("name", "NAME", 0)]
             if iw >= 140:
                 cols.append(("image", "IMAGE", 22))
-            cols += [("cpu", "CPU", 16), ("mem", "MEMORY", 16)]
+            cols += [("cpu", "CPU 100%=1 core", 16), ("mem", "MEMORY", 16)]
             if iw >= 100:
                 cols.append(("net", "NET ↓ ↑", 15))
             if iw >= 88:
@@ -1727,8 +1727,15 @@ class UI:
             if self.filter:
                 title += f" · filter “{self.filter}”"
             n_on = sum(1 for r in rows if r["state"] == "running")
-            sel = self.table(y0, 0, tbl_h, w, title, cols, items, self.container_cell,
-                             right=f"{n_on}/{len(rows)} running")
+            right = f"{n_on}/{len(rows)} running"
+            if any(r["cpu"] > 100 for r in rows):
+                # docker stats math: past 100% means more than one core, not an error
+                for note in (f"CPU over 100% = more than one core busy (max {(os.cpu_count() or 1) * 100}%)",
+                             "CPU over 100% = more than 1 core"):
+                    if len(note) + len(right) + len(title) + 13 < w:
+                        right = f"{note}  ·  {right}"
+                        break
+            sel = self.table(y0, 0, tbl_h, w, title, cols, items, self.container_cell, right=right)
             if not [it for it in items if "_group" not in it]:
                 msg = ("no containers" if self.show_all or self.filter else "no running containers (a shows all)") + (" match this filter" if self.filter else "")
                 self.put(y0 + 3, max(2, (w - len(msg)) // 2), msg, self.pal(DIM))
