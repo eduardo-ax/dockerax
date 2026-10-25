@@ -82,6 +82,7 @@ TIPS = [
     "containers on the same compose network find each other by service name",
     "use the mouse: click to select, wheel to scroll",
     "/ filters by name or image",
+    "select a compose project row (▾) to stop, restart or take down the whole project",
     "b toggles solid/transparent background · g toggles block/braille graphs",
 ]
 
@@ -184,6 +185,11 @@ def parse_ts(s):
 
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def short_path(p):
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if home != "/" and (p == home or p.startswith(home + "/")) else p
 
 
 def clean(s):
@@ -534,6 +540,11 @@ class Collector(threading.Thread):
                 "port_list": c.get("Ports") or [],
                 "compose": labels.get("com.docker.compose.project", ""),
                 "service": labels.get("com.docker.compose.service", ""),
+                # "backend:service_started:false,db:service_healthy:false" → {"backend": "service_started", …}
+                "depends": dict(d.split(":")[:2] for d in labels.get("com.docker.compose.depends_on", "").split(",")
+                                if d.count(":") >= 1),
+                "compose_dir": labels.get("com.docker.compose.project.working_dir", ""),
+                "compose_files": [f for f in labels.get("com.docker.compose.project.config_files", "").split(",") if f],
                 "created": c.get("Created", 0),
                 "mounts": c.get("Mounts") or [],
                 "networks": {k: v.get("IPAddress", "") for k, v in
@@ -846,6 +857,7 @@ class UI:
         self.rows = []
         self.msg = None       # (text, color, command, t)
         self.pending = set()  # ids with an action in progress
+        self.downed = {}      # compose projects taken down here: name → {"dir", "files"} so u can bring them back
         self.logs = None
         self.detail_scroll = 0
         self.ease_vals = {}
@@ -1068,27 +1080,38 @@ class UI:
             return {k: list(v) for k, v in h.items()} if h else {"cpu": [], "mem": [], "rx": [], "tx": []}
 
     def container_items(self, rows):
-        if not self.show_all:
-            rows = [r for r in rows if r["state"] == "running"]
         if self.filter:
             f = self.filter.lower()
             rows = [r for r in rows if f in r["name"].lower() or f in r["image"].lower() or f in r["compose"].lower()]
+        shown = rows if self.show_all else [r for r in rows if r["state"] == "running"]
         if self.sort != "default":
             key = {"cpu": lambda r: -r["cpu"], "mem": lambda r: -r["mem"], "name": lambda r: r["name"]}[self.sort]
-            return sorted(rows, key=key)
+            return sorted(shown, key=key)
         rows = sorted(rows, key=lambda r: (r["state"] != "running", r["name"]))
+        ids = {r["id"] for r in shown}
         groups = {}
         for r in rows:
             groups.setdefault(r["compose"], []).append(r)
-        if list(groups) == [""]:
-            return rows
+        for proj in list(self.downed):
+            if proj in groups:
+                if f"compose:{proj}" not in self.pending:
+                    del self.downed[proj]  # it's back up
+            elif not self.filter or self.filter.lower() in proj.lower():
+                groups[proj] = []
+        if list(groups) in ([""], []):
+            return [r for r in rows if r["id"] in ids]
         items = []
         for proj in sorted(groups, key=lambda p: (p == "", p)):
             members = groups[proj]
+            vis = [r for r in members if r["id"] in ids]
+            if not proj and not vis:
+                continue
             on = sum(1 for r in members if r["state"] == "running")
-            items.append({"_group": proj or "standalone", "on": on, "total": len(members), "compose": bool(proj)})
-            for i, r in enumerate(members):
-                items.append(dict(r, _tree="└─ " if i == len(members) - 1 else "├─ "))
+            # compose projects are selectable: actions on that row act on the whole project
+            items.append({"_group": proj or "standalone", "on": on, "total": len(members), "compose": bool(proj),
+                          "id": f"compose:{proj}" if proj else None, "members": members, "down": not members})
+            for i, r in enumerate(vis):
+                items.append(dict(r, _tree="└─ " if i == len(vis) - 1 else "├─ "))
         return items
 
     # ------------------------------------------------------------ actions
@@ -1153,6 +1176,177 @@ class UI:
         self.scr.clear()
         curses.curs_set(0)
         self.flash(f"back from {n} shell", BLUE, f"docker exec -it {n} sh")
+
+    # ------------------------------------------------------------ compose projects
+    @staticmethod
+    def compose_order(members):
+        """Containers in compose's start order: each service after the ones it depends_on."""
+        svc = {}
+        for r in members:
+            svc.setdefault(r["service"], []).append(r)
+        depth = {}
+
+        def d(s, seen):
+            if s not in depth:
+                deps = [x for x in svc[s][0]["depends"] if x in svc and x not in seen]
+                depth[s] = 1 + max((d(x, seen | {s}) for x in deps), default=-1)
+            return depth[s]
+        levels = {}
+        for s in sorted(svc):
+            levels.setdefault(d(s, {s}), []).extend(svc[s])
+        return [levels[k] for k in sorted(levels)]
+
+    def compose_info(self, proj, members):
+        info = self.downed.get(proj)
+        if info:
+            return info
+        for r in members:
+            if r["compose_files"]:
+                return {"dir": r["compose_dir"], "files": r["compose_files"]}
+        return {"dir": "", "files": []}
+
+    def project_action(self, g, key):
+        proj, members = g["_group"], g["members"]
+        alive = [r for r in members if r["state"] in ("running", "paused")]
+        if key == "u":
+            self.compose_up(proj, members)
+        elif g["down"]:
+            self.flash(f"{proj} is down — u brings it back up (docker compose up -d)", YELLOW)
+        elif key == "s":
+            if alive:
+                self.ask(f"Stop the {len(alive)} running containers of {proj}?", f"docker compose -p {proj} stop",
+                         lambda: self.compose_job(proj, "stop", members))
+            else:
+                self.compose_job(proj, "start", members)
+        elif key == "r":
+            self.ask(f"Restart every container of {proj}?", f"docker compose -p {proj} restart",
+                     lambda: self.compose_job(proj, "restart", members))
+        elif key == "p":
+            if any(r["state"] == "running" for r in members):
+                self.compose_job(proj, "pause", members)
+            elif any(r["state"] == "paused" for r in members):
+                self.compose_job(proj, "unpause", members)
+            else:
+                self.flash(f"nothing running in {proj} to pause", YELLOW)
+        elif key == "x":
+            self.ask(f"Take {proj} down? Removes its {len(members)} containers and its networks (volumes are kept)",
+                     f"docker compose -p {proj} down", lambda: self.compose_job(proj, "down", members))
+        elif key == "e":
+            self.flash("select one of the project's containers to open a shell", YELLOW)
+
+    def compose_job(self, proj, verb, members):
+        """What docker compose does for stop/start/restart/pause/down, done through the API in dependency order."""
+        cli = f"docker compose -p {proj} {verb}"
+        levels = self.compose_order(members)
+        if verb in ("stop", "down"):
+            levels = levels[::-1]  # dependents first: nginx stops before the backend it talks to
+        if verb in ("pause", "unpause"):
+            levels = [members]
+        healthy = {d for r in members for d, c in r["depends"].items() if c == "service_healthy"}
+        ing = {"start": "starting", "stop": "stopping", "restart": "restarting", "pause": "pausing",
+               "unpause": "resuming", "down": "removing"}[verb]
+        ids = {r["id"] for r in members} | {f"compose:{proj}"}
+        self.pending |= ids
+        self.flash(f"running… {cli}", BLUE)
+
+        def one(r):
+            cid, st = r["id"], r["state"]
+            if st == "paused" and verb in ("stop", "restart", "down", "unpause"):
+                api("POST", f"/containers/{cid}/unpause")
+                st = "running"
+            if verb == "start" and st != "running":
+                api("POST", f"/containers/{cid}/start", timeout=60)
+            elif verb in ("stop", "down") and st == "running":
+                api("POST", f"/containers/{cid}/stop", timeout=60)
+            elif verb == "restart":
+                api("POST", f"/containers/{cid}/restart", timeout=60)
+            elif verb == "pause" and st == "running":
+                api("POST", f"/containers/{cid}/pause")
+            if verb == "down":
+                api("DELETE", f"/containers/{cid}?force=1")
+
+        def wait_healthy(r):
+            self.flash(f"waiting for {r['service']} to be healthy — another service depends_on it", BLUE, cli)
+            t0 = time.time()
+            while time.time() - t0 < 90:
+                st = (api("GET", f"/containers/{r['id']}/json").get("State") or {}).get("Health") or {}
+                if st.get("Status") in (None, "healthy"):
+                    return
+                if st.get("Status") == "unhealthy":
+                    raise RuntimeError(f"{r['service']} is unhealthy — see its logs")
+                time.sleep(1)
+            raise RuntimeError(f"{r['service']} still not healthy after 90 s")
+
+        if verb == "down":
+            # remembered from the start, so the row stays put (and selected) while the containers go away
+            self.downed[proj] = self.compose_info(proj, members)
+
+        def work():
+            try:
+                with ThreadPoolExecutor(max_workers=8) as ex:
+                    for level in levels:
+                        self.flash(f"{ing} {', '.join(sorted({r['service'] for r in level}))}…", BLUE, cli)
+                        list(ex.map(one, level))
+                        if verb in ("start", "restart"):
+                            for r in level:
+                                if r["service"] in healthy:
+                                    wait_healthy(r)
+                done = {"start": "started", "stop": "stopped", "restart": "restarted", "pause": "paused",
+                        "unpause": "resumed"}
+                if verb == "down":
+                    flt = quote(json.dumps({"label": [f"com.docker.compose.project={proj}"]}))
+                    nets = 0
+                    for n in api("GET", f"/networks?filters={flt}"):
+                        try:
+                            api("DELETE", f"/networks/{n['Id']}")
+                            nets += 1
+                        except RuntimeError:
+                            pass  # still used by a container outside the project
+                    self.flash(f"✓ {proj} is down — {len(members)} containers and {nets} networks removed, volumes kept",
+                               GREEN, cli)
+                else:
+                    self.flash(f"✓ {proj} {done[verb]}", GREEN, cli)
+            except Exception as e:  # noqa: BLE001
+                self.flash(f"✗ {e}", RED, cli)
+            self.pending -= ids
+            self.cache.invalidate()
+            self.col.wake.set()
+        threading.Thread(target=work, daemon=True).start()
+
+    def compose_up(self, proj, members):
+        """up needs the compose file (it creates containers from it), so this one runs the docker CLI."""
+        info = self.compose_info(proj, members)
+        if not info["files"]:
+            return self.flash(f"no compose file recorded for {proj} — run docker compose up -d in its folder", YELLOW)
+        missing = [f for f in info["files"] if not os.path.exists(f)]
+        if missing:
+            return self.flash(f"compose file not found: {missing[0]} (moved, or on another machine?)", YELLOW)
+        if not shutil.which("docker"):
+            return self.flash("u needs the docker CLI (with the compose plugin)", YELLOW)
+        d = info["dir"] or os.path.dirname(info["files"][0])
+        cli = f"cd {short_path(d)} && docker compose up -d"
+        argv = ["docker", "compose", "-p", proj, "--project-directory", d]
+        for f in info["files"]:
+            argv += ["-f", f]
+        argv += ["up", "-d"]
+        ids = {r["id"] for r in members} | {f"compose:{proj}"}
+        self.pending |= ids
+        self.flash(f"running… {cli}", BLUE)
+
+        def work():
+            try:
+                p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   universal_newlines=True, timeout=600)
+                if p.returncode:
+                    lines = [clean(ln).strip() for ln in (p.stdout + p.stderr).splitlines() if ln.strip()]
+                    raise RuntimeError(lines[-1] if lines else f"docker compose exited with {p.returncode}")
+                self.flash(f"✓ {proj} is up", GREEN, cli)
+            except Exception as e:  # noqa: BLE001
+                self.flash(f"✗ {e}", RED, cli)
+            self.pending -= ids
+            self.cache.invalidate()
+            self.col.wake.set()
+        threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------ run form
     def open_run(self, item):
@@ -1513,6 +1707,8 @@ class UI:
                 self.set_tab(2)
             elif ch == "t":
                 self.set_tab(3)
+            elif ch in ("s", "r", "p", "x", "e", "u") and self.current and "_group" in self.current:
+                self.project_action(self.current, ch)
             elif ch in ("s", "r", "p", "x", "e") and self.current:
                 self.container_action(self.current, ch)
         elif self.view == 1 and ch == "p":
@@ -1695,7 +1891,7 @@ class UI:
             self.put(y + 1, hx, hdr[:cw], self.pal(DIM) | BOLD, x + w - 1)
             hx += cw + 1
         body_y, body_h = y + 2, h - 3
-        selectable = [i for i, it in enumerate(items) if "_group" not in it]
+        selectable = [i for i, it in enumerate(items) if "_group" not in it or it.get("id")]
         if not selectable or body_h <= 0:
             return None
         if self.sel_key[v] is not None:
@@ -1709,7 +1905,7 @@ class UI:
         self.sel_key[v] = keyf(items[pos])
         top = self.scroll[v]
         if pos < top:
-            top = pos - 1 if pos > 0 and "_group" in items[pos - 1] else pos
+            top = pos - 1 if pos > 0 and "_group" in items[pos - 1] and not items[pos - 1].get("id") else pos
         if pos >= top + body_h:
             top = pos - body_h + 1
         top = max(0, min(top, len(items) - body_h)) if len(items) > body_h else 0
@@ -1717,7 +1913,7 @@ class UI:
         sel_index = {i: n for n, i in enumerate(selectable)}
         for n, it in enumerate(items[top:top + body_h]):
             yy, idx = body_y + n, top + n
-            if "_group" in it:
+            if "_group" in it and not it.get("id"):
                 self.draw_group(yy, ix, iw, it)
                 continue
             selected = idx == pos
@@ -1728,6 +1924,9 @@ class UI:
             self.hit(yy, x + 1, x + w - 1, lambda n=sel_index[idx]: (self.__setattr__("detail_scroll", 0),
                                                                       self.sel.__setitem__(v, n),
                                                                       self.sel_key.__setitem__(v, None)))
+            if "_group" in it:
+                self.draw_group(yy, ix, iw, it, bg)
+                continue
             cx = ix
             for (key, _, _), cw in zip(cols, widths):
                 cell(it, key, yy, cx, cw, bg)
@@ -1739,15 +1938,20 @@ class UI:
                 self.put(ty + i, x + w - 1, "┃", self.pal(SUB))
         return items[pos]
 
-    def draw_group(self, y, x, w, it):
+    def draw_group(self, y, x, w, it, bg=None):
         x0 = x
-        x += self.put(y, x, "▾ ", self.pal(MAUVE))
-        x += self.put(y, x, it["_group"], self.pal(MAUVE) | BOLD)
-        kind = "compose" if it["compose"] else "no compose"
-        color = GREEN if it["on"] == it["total"] else YELLOW if it["on"] else DIM
-        x += self.segs(y, x + 2, [(f"{kind} · ", DIM), (f"{it['on']}/{it['total']} running", color)]) - x
+        busy = it.get("id") in self.pending or any(r["id"] in self.pending for r in it.get("members", ()))
+        x += self.put(y, x, SPIN[self.frame % len(SPIN)] + " " if busy else "▾ ", self.pal(YELLOW if busy else MAUVE, bg))
+        x += self.put(y, x, it["_group"], self.pal(MAUVE, bg) | BOLD)
+        if it.get("down"):
+            parts = [("compose · ", DIM), ("down", DIM, True), (" · u brings it back up", FAINT)]
+        else:
+            kind = "compose" if it["compose"] else "no compose"
+            color = GREEN if it["on"] == it["total"] else YELLOW if it["on"] else DIM
+            parts = [(f"{kind} · ", DIM), (f"{it['on']}/{it['total']} running", color)]
+        x = self.segs(y, x + 2, parts, x0 + w, bg)
         if x0 + w - x > 3:
-            self.put(y, x + 1, "┄" * (x0 + w - x - 1), self.pal(FAINT))
+            self.put(y, x + 1, "┄" * (x0 + w - x - 1), self.pal(FAINT, bg))
 
     def state_icon(self, r):
         st, f = r["state"], self.frame
@@ -1800,12 +2004,12 @@ class UI:
             n_on = sum(1 for r in rows if r["state"] == "running")
             sel = self.table(y0, 0, tbl_h, w, title, cols, items, self.container_cell,
                              right=f"{n_on}/{len(rows)} running")
-            if not [it for it in items if "_group" not in it]:
+            if not items:
                 msg = ("no containers" if self.show_all or self.filter else "no running containers (a shows all)") + (" match this filter" if self.filter else "")
                 self.put(y0 + 3, max(2, (w - len(msg)) // 2), msg, self.pal(DIM))
                 self.put(y0 + 4, max(2, (w - 44) // 2), "try:  docker run -d -p 8080:80 nginx       ", self.pal(FAINT))
         else:
-            sel_rows = [it for it in items if "_group" not in it]
+            sel_rows = [it for it in items if "_group" not in it or it.get("id")]
             for r in sel_rows:
                 if r["id"] == self.sel_key[0]:
                     sel = r
@@ -1861,6 +2065,9 @@ class UI:
 
     def draw_detail(self, y, x, h, w, r):
         self.box(y, x, h, w, right="z enlarge" if not self.zoom else "z / esc back")
+        if r and "_group" in r:
+            self.stop_logs()
+            return self.draw_project(y, x, h, w, r)
         if not r:
             self.put(y + h // 2, x + max(2, (w - 30) // 2), "no container selected      ", self.pal(DIM))
             self.stop_logs()
@@ -1880,6 +2087,123 @@ class UI:
         if self.tab != 1:
             self.stop_logs()
         [self.tab_metrics, self.tab_logs, self.tab_info, self.tab_top][self.tab](r, iy, ix, ih, iw)
+
+    def draw_project(self, y, x, h, w, g):
+        proj, members = g["_group"], g["members"]
+        tx = x + 2
+        tx += self.put(y, tx, " ▾ ", self.pal(MAUVE) | BOLD)
+        tx += self.put(y, tx, proj + " ", self.pal(TEXT) | BOLD)
+        self.put(y, tx + 1, " compose project ", self.pal(BASE, MAUVE) | BOLD, x + w - 12)
+        iy, ix, ih, iw = y + 1, x + 2, h - 2, w - 4
+        end = iy + ih
+        info = self.compose_info(proj, members)
+        where = short_path(info["dir"] or (os.path.dirname(info["files"][0]) if info["files"] else "")) or "?"
+        files = ", ".join(short_path(f) for f in info["files"]) or "unknown (no compose labels)"
+        if g["down"]:
+            self.segs(iy + 1, ix, [("project ", DIM), (proj, MAUVE, True), (" is down", TEXT, True),
+                                   (" — its containers and networks were removed; volumes and images are kept.", DIM)], ix + iw)
+            self.segs(iy + 3, ix, [("u", BLUE, True), ("  brings it back   ", DIM), ("$ ", MAUVE),
+                                   (f"cd {where} && docker compose up -d", TEXT)], ix + iw)
+            self.segs(iy + 4, ix, [("   compose reads the file again and creates the containers and networks from it", FAINT)], ix + iw)
+            self.segs(iy + 6, ix, [("file  ", DIM), (files, SUB)], ix + iw)
+            return
+        running = [r for r in members if r["state"] == "running"]
+        cw = min(60, max(26, iw // 4)) if iw >= 84 and running and ih >= 12 else 0
+        lw = iw - cw - (3 if cw else 0)
+        levels = self.compose_order(members)
+        yy = iy
+
+        def line(parts):
+            nonlocal yy
+            if yy < end:
+                self.segs(yy, ix, parts, ix + lw)
+            yy += 1
+        cpu = sum(r["cpu"] for r in running)
+        on = len(running)
+        line([(f"{on}/{len(members)} running", GREEN if on == len(members) else YELLOW if on else DIM, True),
+              ("  ·  CPU ", DIM), (f"{cpu:.1f}%", grad(G_LOAD, cpu / 100), True),
+              ("  ·  memory ", DIM), (human(sum(r["mem"] for r in running)), MAUVE, True)]
+             + ([("  ·  net ↓", DIM), (human(sum(r["rx_rate"] for r in running), "/s"), TEXT),
+                 (" ↑", DIM), (human(sum(r["tx_rate"] for r in running), "/s"), TEXT)] if lw >= 80 else []))
+        line([("file      ", DIM), (files, SUB)])
+        nets = sorted({n for r in members for n in r["networks"]})
+        vols = sorted({m.get("Name", "") for r in members for m in r["mounts"] if m.get("Type") == "volume"})
+        line([("networks  ", DIM), (", ".join(nets) or "—", TEAL)] + ([("   volumes  ", DIM), (", ".join(vols), PEACH)] if vols else []))
+        def chain(lvs):
+            out = []
+            for i, lv in enumerate(lvs):
+                if i:
+                    out.append((" → ", FAINT))
+                out.append((", ".join(sorted({r["service"] for r in lv})), TEXT, True))
+            return out
+        # from depends_on: what others need starts first and stops last
+        line([("start     ", DIM)] + chain(levels))
+        line([("stop      ", DIM)] + chain(levels[::-1]))
+        yy += 1
+        # services, in start order
+        sw = max([len(r["service"]) for r in members] + [7]) + 2
+        nw = max([len(r["name"]) for r in members] + [9]) + 2 if lw >= 90 else 0
+        if yy < end:
+            hx = ix + 2
+            for t, cwid in (("SERVICE", sw), ("CONTAINER", nw), ("CPU", 8), ("MEMORY", 9), ("PORTS", 0)):
+                if cwid or t == "PORTS":
+                    self.put(yy, hx, t, self.pal(DIM) | BOLD, ix + lw)
+                    hx += cwid
+        yy += 1
+        for r in (r for lv in levels for r in lv):
+            if yy >= end:
+                break
+            icon, color = self.state_icon(r)
+            up = r["state"] == "running"
+            self.put(yy, ix, icon, self.pal(color) | BOLD)
+            cx = ix + 2
+            self.put(yy, cx, r["service"], self.pal(TEXT if up else SUB) | BOLD, ix + lw)
+            cx += sw
+            if nw:
+                self.put(yy, cx, r["name"], self.pal(DIM), ix + lw)
+                cx += nw
+            self.put(yy, cx, f"{r['cpu']:.1f}%" if up else "—", self.pal(grad(G_LOAD, r["cpu"] / 100) if up else FAINT), ix + lw)
+            cx += 8
+            self.put(yy, cx, human(r["mem"]) if up else "—", self.pal(MAUVE if up else FAINT), ix + lw)
+            cx += 9
+            deps = [f"{d} (healthy)" if c == "service_healthy" else d for d, c in sorted(r["depends"].items())]
+            cx += self.put(yy, cx, r["ports"] or ("—" if up else status_text(r["status"])),
+                           self.pal(PEACH if r["ports"] else FAINT), ix + lw)
+            if deps:
+                self.put(yy, cx + 2, "needs " + ", ".join(deps), self.pal(FAINT), ix + lw)
+            yy += 1
+        acts = [("s", "stop" if any(r["state"] in ("running", "paused") for r in members) else "start", "every service, in order"),
+                ("r", "restart", "every service"),
+                ("x", "down", "rm containers + networks, keeps volumes"),
+                ("u", "up -d", "re-reads the compose file")]
+        if end - yy >= len(acts) + 1:
+            yy = end - len(acts)
+            pre = "docker compose" if lw >= 75 else "compose"
+            for k, verb, what in acts:
+                cmd = f"{pre} {verb}"
+                self.segs(yy, ix, [(k, BLUE, True), ("  ", DIM), (cmd.ljust(len(pre) + 10), TEXT), (what, DIM)], ix + lw)
+                yy += 1
+        if cw:
+            cx = ix + lw + 3
+            for yy in range(iy, end):
+                self.put(yy, cx - 2, "│", self.pal(FAINT))
+            hist = [self.hist_of(r["id"]) for r in running]
+
+            def total(key):
+                n = max(len(hh[key]) for hh in hist)
+                return [sum(hh[key][i - n + len(hh[key])] for hh in hist if i - n + len(hh[key]) >= 0) for i in range(n)]
+
+            def pct(v):
+                return f"{v:.0f}%"
+
+            def size(v):
+                return re.sub(r"\.0(?=[A-Z])", "", human(v)) if v else "0"
+            top = ih // 2
+            self.segs(iy, cx, [("CPU ", SUB, True), (f"{cpu:.1f}%", grad(G_LOAD, cpu / 100), True), ("  total", DIM)], cx + cw)
+            self.chart(iy + 1, cx, cw, top - 1, total("cpu"), 100, G_LOAD, pct, refs=[(100, "1 core")], times=False)
+            mem = sum(r["mem"] for r in running)
+            self.segs(iy + top, cx, [("MEMORY ", SUB, True), (human(mem), MAUVE, True), ("  total", DIM)], cx + cw)
+            self.chart(iy + top + 1, cx, cw, ih - top - 1, total("mem"), 64 * 1024 ** 2, G_MEM, size, unit=1024 ** 2)
 
     def tab_metrics(self, r, y, x, h, w):
         if r["state"] != "running":
@@ -2461,12 +2785,14 @@ class UI:
             version(x)
             return
         keys = {
+            "project": [("↑↓", "move"), ("s", "start/stop all"), ("r", "restart all"), ("p", "pause all"), ("x", "down"),
+                        ("u", "up -d"), ("/", "filter"), ("a", "stopped"), ("?", "help"), ("q", "quit")],
             0: [("↑↓", "move"), ("←→", "tabs"), ("s", "start/stop"), ("r", "restart"), ("p", "pause"), ("e", "shell"),
                 ("x", "remove"), ("l", "logs"), ("/", "filter"), ("c/m/n", "sort"), ("a", "stopped"), ("?", "help"), ("q", "quit")],
             1: [("↑↓", "move"), ("p", "pull"), ("r", "run"), ("x", "delete"), ("P", "prune dangling"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
             2: [("↑↓", "move"), ("x", "delete"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
             3: [("↑↓", "move"), ("x", "remove"), ("/", "filter"), ("z", "enlarge"), ("?", "help"), ("q", "quit")],
-        }[self.view]
+        }["project" if self.view == 0 and self.current and "_group" in self.current else self.view]
         x = 1
         for key, desc in keys:
             if x + len(key) + len(desc) + 3 >= vx - 1:
@@ -2685,6 +3011,12 @@ class UI:
         [("  C         ", BLUE, True), ("clear events panel ", SUB), ("p       ", BLUE, True), ("pull an image (images view)", SUB)],
         [("            ", BLUE, True), ("                   ", SUB), ("r       ", BLUE, True), ("run a container (images view)", SUB)],
         [("  mouse     ", BLUE, True), ("click selects, wheel scrolls, click the tabs", SUB)],
+        [],
+        [("COMPOSE PROJECTS", MAUVE, True), ("  select the ▾ project row, then:", DIM)],
+        [("  s         ", BLUE, True), ("stop / start all   ", SUB), ("r       ", BLUE, True), ("restart all (docker compose restart)", SUB)],
+        [("  p         ", BLUE, True), ("pause / resume all ", SUB), ("x       ", BLUE, True), ("down: remove containers + networks", SUB)],
+        [("  u         ", BLUE, True), ("up -d              ", SUB), ("        ", BLUE), ("re-reads the compose file (also after down)", SUB)],
+        [("            ", BLUE), ("services start in depends_on order (db before backend) and stop in reverse.", DIM)],
         [],
         [("WHAT THE NUMBERS MEAN", MAUVE, True)],
         [("  CPU %     ", TEAL, True), ("100% = one full core busy. This server has ", SUB), (f"{os.cpu_count()}", TEXT, True), (" cores,", SUB)],
