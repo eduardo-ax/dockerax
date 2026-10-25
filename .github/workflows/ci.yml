@@ -76,7 +76,7 @@ jobs:
       - name: Open the dashboard, visit every view, quit
         run: |
           # script gives dockerax a real terminal; the keys go through its stdin
-          (sleep 6; for k in 2 3 4 1 l i t; do printf "$k"; sleep 1; done; printf q) |
+          (sleep 6; for k in 2 3 4 5 1 l i t; do printf "$k"; sleep 1; done; printf q) |
             TERM=xterm-256color timeout 60 script -qec "python3 dockerax.py 2>err.log" /dev/null >/dev/null
           if [ -s err.log ]; then cat err.log; exit 1; fi
       - if: always()
