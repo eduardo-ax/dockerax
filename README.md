@@ -48,6 +48,10 @@ cd dockerax
 
 ![networks view with the network map](docs/networks.png)
 
+**Compose projects** — select a project row (`▾ demo`) to act on the whole project: stop/start, restart, pause, `down` and `up -d`. Services start in `depends_on` order and stop in reverse, like `docker compose` does.
+
+![compose project panel with start/stop order and totals](docs/compose.png)
+
 **Images** — sizes, which ones are in use, and the layers of the selected image (each Dockerfile instruction with its size).
 
 ![images view with layers](docs/images.png)
@@ -75,13 +79,14 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
   - **logs** — live `docker logs -f`, stderr marked in red, log levels and HTTP status codes colored, scrollback.
   - **info** — restart policy, command, health, ports explained in plain words with a URL, networks with IPs, mounts, env vars (secrets masked) and an approximate `docker run` command that would recreate it.
   - **processes** — `docker top`, sorted by CPU.
+- **Compose projects** — select the project row to see its services in start order (from `depends_on`), what each one needs, totals and CPU/memory graphs for the whole project, the compose file, networks and volumes. `s` stops/starts everything in dependency order (waiting for `service_healthy` dependencies), `r` restarts, `p` pauses, `x` is `docker compose down` (containers and networks removed, volumes kept) and `u` is `docker compose up -d` (re-reads the compose file — also brings back a project you took down).
 - **Images** — size bars, in-use count, dangling images and image **layers**.
 - **Pull images** (`p` in the images view) — type a name like `nginx:alpine`; it shows how the name breaks down (registry, user, name, tag — no tag means `latest`) and then live progress per layer, including layers that *already exist* because another image shares them. `Esc` cancels; when it finishes, `r` runs it.
 - **Run a container from an image** (`r` in the images view) — a small form: name, host → container port (suggested from the image's `EXPOSE`, with a check that the host port is free), detached (`-d`) or interactive (`-it`), `--rm` and restart policy. Each field explains its flag, and the matching `docker run` command updates as you type.
 - **Volumes** — size, which containers mount each volume and where.
 - **Networks** — subnet, gateway and the **network map** described above.
 - **Live events** — Docker's event stream described in words.
-- **Actions** — pull images, run a container from an image, start/stop, restart, pause, remove, open a shell inside a container, delete images/volumes/networks, prune dangling images. Destructive actions ask for confirmation (`y`), and every action shows the equivalent `docker` command.
+- **Actions** — pull images, run a container from an image, start/stop (also whole compose projects), restart, pause, remove, open a shell inside a container, delete images/volumes/networks, prune dangling images. Destructive actions ask for confirmation (`y`), and every action shows the equivalent `docker` command.
 - **Mouse** — click rows, tabs and views; the wheel scrolls.
 - Solid or transparent background, block or braille graphs — both remembered between runs.
 
@@ -91,7 +96,7 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
 - **Python 3.8+** — already installed on most distros.
 - Access to the Docker socket: be root or a member of the `docker` group (`sudo usermod -aG docker $USER`, then log out and back in). Set `DOCKER_SOCK` to use another socket path.
 - A **256-color terminal** (`TERM=xterm-256color` or similar) and a font with box-drawing and braille characters (any modern monospace font).
-- The `docker` CLI only for the **e** key (shell inside a container).
+- The `docker` CLI only for the **e** key (shell inside a container) and **u** (`docker compose up -d`, which needs the compose file).
 
 ## Keys
 
@@ -102,10 +107,11 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
 | `←` `→` / `Tab` | switch the bottom tab (containers) or the view |
 | `PgUp` `PgDn` | scroll logs / info / processes |
 | `End` / `G` | resume following logs |
-| `s` | start / stop |
+| `s` | start / stop (on a compose project row: the whole project) |
 | `r` | restart |
 | `p` | pause / resume |
-| `x` | remove (stopped container, image, volume, network) |
+| `x` | remove (stopped container, image, volume, network) · `docker compose down` on a project row |
+| `u` | `docker compose up -d` (on a project row) |
 | `p` (images view) | pull an image (`docker pull`) |
 | `r` (images view) | run a container from the selected image |
 | `P` | prune dangling images (images view) |
