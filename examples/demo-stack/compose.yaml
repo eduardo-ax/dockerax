@@ -1,0 +1,47 @@
+# Demo: nginx -> backend (python) -> postgres
+# The database sits on an internal network that nginx cannot reach.
+name: demo
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app-secret
+      POSTGRES_DB: app
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://app:app-secret@db:5432/app
+    networks: [web, data]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8081:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks: [web]
+    depends_on: [backend]
+    restart: unless-stopped
+
+networks:
+  web: {}
+  data:
+    internal: true   # no internet access, only backend and db live here
+
+volumes:
+  db-data: {}
