@@ -31,7 +31,7 @@ SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 INTERVAL = 2.0
 HIST = 300
 FPS = 10
-VERSION = "2.0"
+VERSION = "2.1.0"
 
 # palette (catppuccin mocha) — converted to 256 colors when drawing
 TEXT = (205, 214, 244)
