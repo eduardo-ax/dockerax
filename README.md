@@ -98,7 +98,8 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
 ## Requirements
 
 - **Linux** with Docker Engine (host stats come from `/proc`).
-- **Python 3.8+** — already installed on most distros.
+- **Python 3.8+** — already installed on most distros. Only the standard library is used, including `curses`; on **openSUSE** that one is a separate package: `sudo zypper install python3-curses`.
+- **Tested on** (CI, with each distro's own `python3`): Ubuntu 20.04, 22.04, 24.04 and 26.04 · Debian 12 and 13 · Fedora · Arch Linux · Alpine · openSUSE Tumbleweed — plus Python 3.8 to 3.14 and a smoke test of the dashboard against a real Docker.
 - Access to the Docker socket: be root or a member of the `docker` group (`sudo usermod -aG docker $USER`, then log out and back in). Set `DOCKER_SOCK` to use another socket path.
 - A **256-color terminal** (`TERM=xterm-256color` or similar) and a font with box-drawing and braille characters (any modern monospace font).
 - The `docker` CLI only for the **e** key (shell inside a container) and **u** (`docker compose up -d`, which needs the compose file).
