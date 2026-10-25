@@ -19,6 +19,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -2658,6 +2659,9 @@ def main(scr):
 
 
 if __name__ == "__main__":
+    if any(a in ("--version", "-V") for a in sys.argv[1:]):
+        print(f"dockerax {VERSION}")
+        sys.exit(0)
     if not os.access(SOCK, os.R_OK | os.W_OK):
         raise SystemExit(f"no access to {SOCK} (is the user in the docker group?)")
     locale.setlocale(locale.LC_ALL, "")

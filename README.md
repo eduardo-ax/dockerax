@@ -38,7 +38,7 @@ cd dockerax
 
 **On a remote server:** install it there the same way and open it over SSH with `ssh -t user@server dockerax` (`-t` gives it a terminal).
 
-**Update:** run the same `curl` command again. **Uninstall:** `rm ~/.local/bin/dockerax ~/.config/dockerax.json`.
+**Version:** `dockerax --version` (also shown in the help screen, `?`); compare it with the [latest release](https://github.com/eduardo-ax/dockerax/releases/latest). **Update:** run the same `curl` command again. **Uninstall:** `rm ~/.local/bin/dockerax ~/.config/dockerax.json`.
 
 ## Screenshots
 
