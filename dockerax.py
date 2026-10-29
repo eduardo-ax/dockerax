@@ -65,6 +65,40 @@ G_SIZE = [TEAL, BLUE, MAUVE]
 
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 APP_BG = (24, 24, 37)
+
+# themes replace the palette above when drawing (Pal.idx and grad look colors up in THEME_MAP);
+# each theme lists its colors in ROLES order
+ROLES = (TEXT, SUB, DIM, FAINT, LINE, BAR_BG, SEL_BG, BASE, APP_BG, BLUE, MAUVE, GREEN, YELLOW, PEACH,
+         RED, TEAL, SKY, PINK, LAVENDER)
+THEMES = {
+    "catppuccin": ROLES,
+    "tokyo night": ((192, 202, 245), (169, 177, 214), (115, 122, 162), (65, 72, 104), (84, 92, 126), (41, 46, 66), (51, 70, 124),
+                    (26, 27, 38), (22, 22, 30), (122, 162, 247), (187, 154, 247), (158, 206, 106), (224, 175, 104), (255, 158, 100),
+                    (247, 118, 142), (115, 218, 202), (125, 207, 255), (255, 117, 181), (157, 124, 216)),
+    "gruvbox": ((235, 219, 178), (213, 196, 161), (146, 131, 116), (102, 92, 84), (124, 111, 100), (60, 56, 54), (80, 73, 69),
+                (40, 40, 40), (29, 32, 33), (131, 165, 152), (211, 134, 155), (184, 187, 38), (250, 189, 47), (254, 128, 25),
+                (251, 73, 52), (142, 192, 124), (125, 174, 163), (234, 105, 98), (177, 152, 190)),
+    "nord": ((236, 239, 244), (216, 222, 233), (124, 135, 159), (76, 86, 106), (86, 96, 117), (59, 66, 82), (67, 76, 94),
+             (46, 52, 64), (36, 41, 51), (129, 161, 193), (180, 142, 173), (163, 190, 140), (235, 203, 139), (208, 135, 112),
+             (191, 97, 106), (143, 188, 187), (136, 192, 208), (199, 150, 180), (150, 150, 190)),
+    "dracula": ((248, 248, 242), (191, 195, 210), (98, 114, 164), (68, 71, 90), (80, 86, 120), (52, 55, 70), (68, 71, 90),
+                (40, 42, 54), (33, 34, 44), (139, 163, 255), (189, 147, 249), (80, 250, 123), (241, 250, 140), (255, 184, 108),
+                (255, 85, 85), (110, 235, 200), (139, 233, 253), (255, 121, 198), (170, 160, 250)),
+    "github dark": ((230, 237, 243), (201, 209, 217), (125, 133, 144), (72, 79, 88), (48, 54, 61), (33, 38, 45), (28, 46, 74),
+                    (22, 27, 34), (13, 17, 23), (88, 166, 255), (188, 140, 255), (63, 185, 80), (210, 153, 34), (219, 109, 40),
+                    (248, 81, 73), (57, 197, 207), (121, 192, 255), (247, 120, 186), (210, 168, 255)),
+}
+THEME_MAP = {}
+
+
+def set_theme(name):
+    """Makes every palette color draw as the theme's; unknown names fall back to catppuccin."""
+    name = name if name in THEMES else "catppuccin"
+    THEME_MAP.clear()
+    THEME_MAP.update(zip(ROLES, THEMES[name]))
+    return name
+
+
 CONFIG = os.path.expanduser("~/.config/dockerax.json")
 BLOCKS = " ▁▂▃▄▅▆▇█"
 VIEWS = ["containers", "images", "volumes", "networks", "disk"]
@@ -85,6 +119,7 @@ TIPS = [
     "select a compose project row (▾) to stop, restart or take down the whole project",
     "5 shows what takes disk space and what can be freed safely",
     "b toggles solid/transparent background · g toggles block/braille graphs",
+    "T switches the color theme: catppuccin, tokyo night, gruvbox, nord, dracula, github dark",
 ]
 
 
@@ -777,7 +812,8 @@ def grad(stops, t):
     t = max(0.0, min(1.0, t))
     seg = t * (len(stops) - 1)
     i = min(int(seg), len(stops) - 2)
-    return lerp(stops[i], stops[i + 1], seg - i)
+    a, b = stops[i], stops[i + 1]
+    return lerp(THEME_MAP.get(a, a), THEME_MAP.get(b, b), seg - i)
 
 
 class Pal:
@@ -795,12 +831,13 @@ class Pal:
     def set_solid(self, solid):
         """solid paints APP_BG; otherwise uses the terminal's (maybe transparent) background."""
         self.solid = solid and self.full
-        self.dflt = to256(*APP_BG) if self.solid else self.term_bg
+        self.dflt = to256(*THEME_MAP.get(APP_BG, APP_BG)) if self.solid else self.term_bg
         self.pairs = {}
 
     def idx(self, rgb):
         if rgb is None:
             return self.dflt
+        rgb = THEME_MAP.get(rgb, rgb)
         return to256(*rgb) if self.full else to8(*rgb)
 
     def __call__(self, fg, bg=None):
@@ -833,6 +870,7 @@ class UI:
         self.scr = scr
         self.col = col
         self.cfg = load_config()
+        self.theme = set_theme(self.cfg.get("theme", "catppuccin"))
         self.pal = Pal(self.cfg.get("solid", True))
         self.blocks = self.cfg.get("graph", "blocks") == "blocks"
         self.cache = Cache()
@@ -1678,6 +1716,13 @@ class UI:
             self.cfg["graph"] = "blocks" if self.blocks else "braille"
             save_config(self.cfg)
             self.flash("solid block graphs" if self.blocks else "braille graphs (higher resolution)", BLUE)
+        elif ch == "T":
+            names = list(THEMES)
+            self.theme = set_theme(names[(names.index(self.theme) + 1) % len(names)])
+            self.pal.set_solid(self.pal.solid)
+            self.cfg["theme"] = self.theme
+            save_config(self.cfg)
+            self.flash(f"theme: {self.theme}  ({names.index(self.theme) + 1}/{len(names)} · T for the next one)", MAUVE)
         elif k in (curses.KEY_RIGHT, 9):
             if self.view == 0:
                 self.set_tab(self.tab + 1)
@@ -3314,6 +3359,7 @@ class UI:
         [("  z         ", BLUE, True), ("enlarge the panel  ", SUB), ("/       ", BLUE, True), ("filter by name", SUB)],
         [("  c m n     ", BLUE, True), ("sort cpu/mem/name  ", SUB), ("a       ", BLUE, True), ("show/hide stopped", SUB)],
         [("  b         ", BLUE, True), ("solid/transparent  ", SUB), ("g       ", BLUE, True), ("block / braille graphs", SUB)],
+        [("  T         ", BLUE, True), ("theme  ", SUB), (" · ".join(THEMES), DIM)],
         [("  C         ", BLUE, True), ("clear events panel ", SUB), ("p       ", BLUE, True), ("pull an image (images view)", SUB)],
         [("            ", BLUE, True), ("                   ", SUB), ("r       ", BLUE, True), ("run a container (images view)", SUB)],
         [("  mouse     ", BLUE, True), ("click selects, wheel scrolls, click the tabs", SUB)],
