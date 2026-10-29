@@ -72,6 +72,10 @@ cd dockerax
 
 ![logs tab](docs/logs.png)
 
+**Themes** — `T` switches between Catppuccin Mocha, Tokyo Night, Gruvbox, Nord, Dracula and GitHub Dark; the choice is remembered.
+
+![the six color themes side by side](docs/themes.png)
+
 All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in this repo: `nginx → backend → postgres`.
 
 ## Features
