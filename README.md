@@ -93,7 +93,8 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
 - **Live events** — Docker's event stream described in words.
 - **Actions** — pull images, run a container from an image, start/stop (also whole compose projects), restart, pause, remove, open a shell inside a container, delete images/volumes/networks, prune dangling images. Destructive actions ask for confirmation (`y`), and every action shows the equivalent `docker` command.
 - **Mouse** — click rows, tabs and views; the wheel scrolls.
-- Solid or transparent background, block or braille graphs — both remembered between runs.
+- **Color themes** (`T`) — Catppuccin Mocha (default), Tokyo Night, Gruvbox, Nord, Dracula and GitHub Dark.
+- Solid or transparent background, block or braille graphs — remembered between runs, like the theme.
 
 ## Requirements
 
@@ -133,6 +134,7 @@ All screenshots show the [demo stack](#try-it-with-the-demo-stack) included in t
 | `C` | clear the events panel |
 | `b` | solid / transparent background |
 | `g` | block / braille graphs |
+| `T` | next color theme |
 | `?` | help: shortcuts and what the numbers mean |
 | `q` | quit |
 
@@ -153,14 +155,15 @@ docker compose down -v            # remove everything, including the database vo
 Preferences are saved in `~/.config/dockerax.json`:
 
 ```json
-{"solid": true, "graph": "blocks", "events_cleared": 1792877087}
+{"solid": true, "graph": "blocks", "theme": "nord", "events_cleared": 1792877087}
 ```
 
+- `theme` — `"catppuccin"`, `"tokyo night"`, `"gruvbox"`, `"nord"`, `"dracula"` or `"github dark"` (`T`).
 - `solid` — paint dockerax's own background instead of the terminal's (`b`).
 - `graph` — `"blocks"` or `"braille"` (`g`).
 - `events_cleared` — Unix time of the last `C`. Docker keeps its event history in memory and dockerax normally asks for the last 6 hours; after a clear it only asks for newer events. Nothing is deleted from Docker.
 
-Constants at the top of `dockerax.py`: `INTERVAL` (seconds between polls, default 2), `HIST` (graph history samples), `FPS` (redraw rate) and the color palette (Catppuccin Mocha).
+Constants at the top of `dockerax.py`: `INTERVAL` (seconds between polls, default 2), `HIST` (graph history samples), `FPS` (redraw rate), the color palette (Catppuccin Mocha) and `THEMES`, the other themes' colors.
 
 ## How it works
 
